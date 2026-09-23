@@ -1,0 +1,22 @@
+name = "deepseek-mcp"
+main = "src/worker.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+preview_urls = false
+
+[vars]
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL = "deepseek-flash"
+
+# Livro-caixa de consumo + botão PARAR (instância única, SQLite).
+[[durable_objects.bindings]]
+name = "LEDGER"
+class_name = "Ledger"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Ledger"]
+
+# Secrets (não ficam no código):
+#   npx wrangler secret put DEEPSEEK_API_KEY
+#   npx wrangler secret put MCP_SECRET

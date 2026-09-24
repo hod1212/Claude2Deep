@@ -286,7 +286,7 @@ O que cada parte do painel faz está em [USO.md](USO.md#o-painel-de-consumo).
 **Deu certo se:** a resposta vem acompanhada de um rodapé parecido com:
 
 ```
-[deepseek: id=1, model=deepseek-flash, finish=stop, in=120, out=15, ≈US$ 0.0000, tempo=2s]
+[ds id=1 · fim=stop · in=120 · out=15 · ≈US$ 0.0000 · 2s · raw: https://...]
 ```
 
 **Pronto! A instalação está concluída.** 🎉 A chamada também aparece no painel.

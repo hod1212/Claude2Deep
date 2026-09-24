@@ -15,6 +15,8 @@ Você cadastra uma vez e ele funciona no **claude.ai**, nos **apps** (desktop e 
 ## O que ele faz
 
 - 🧠➡️🦾 **Delegação:** o Claude manda ao DeepSeek rascunhos, códigos, testes, traduções, resumos e extrações de dados.
+- ⚡ **Sempre o DeepSeek-V4.1-Flash**, o melhor custo-benefício, com raciocínio ajustável (desligado para tarefas mecânicas: mais rápido e barato).
+- 🪙 **Feito para o Claude economizar:** arquivos enviados por link (sem o Claude reescrever conteúdo), reaproveitamento de resultados entre etapas e download direto dos resultados.
 - 📦 **Lotes:** a mesma tarefa em até 25 itens em paralelo.
 - 🧾 **Dados estruturados:** respostas em JSON, validadas, prontas para virar tabela.
 - ⏳ **Tarefas longas sem limite de tempo:** a tarefa continua no servidor e o Claude busca o resultado quando fica pronto.
@@ -75,9 +77,10 @@ Painel: `https://deepseek-mcp.SEU-SUBDOMINIO.workers.dev/painel#SUA_SENHA`
 | `deepseek_batch` | A mesma instrução para até 25 itens, em paralelo |
 | `deepseek_json` | Saída JSON validada |
 | `deepseek_wait` | Buscar resultados de tarefas longas e paginar textos grandes |
+| `deepseek_upload_url` | Link para o Claude enviar arquivos com `curl`, sem copiar conteúdo |
 | `deepseek_usage` | Consumo e estado do botão PARAR |
 
-Perfis prontos (`preset`): `code`, `extract`, `draft`, `translate`, `summarize`, `review`. Modelos: `deepseek-flash` (padrão) e `deepseek-v4-pro`. Detalhes em [docs/USO.md](docs/USO.md).
+Parâmetros comuns: `files` e `use_results` (contexto sem copiar texto), `preset` (`code`, `extract`, `draft`, `translate`, `summarize`, `review`), `reasoning` (`off`, `low`, `high`, `max`), `deliver` (`inline` ou `link`), `job`/`step`. O modelo é sempre o `deepseek-flash` (V4.1-Flash). Detalhes em [docs/USO.md](docs/USO.md).
 
 ## Importante saber
 

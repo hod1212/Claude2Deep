@@ -1,7 +1,7 @@
 {
   "name": "claude2deep",
-  "version": "4.0.0",
-  "description": "Servidor MCP remoto (Cloudflare Workers) que dá ao Claude ferramentas para delegar trabalho ao DeepSeek, com painel de consumo e botão PARAR.",
+  "version": "5.0.0",
+  "description": "Servidor MCP remoto (Cloudflare Workers) que dá ao Claude ferramentas para delegar trabalho ao DeepSeek-V4.1-Flash, com painel de consumo, botão PARAR e envio de arquivos por link.",
   "private": true,
   "type": "module",
   "license": "MIT",

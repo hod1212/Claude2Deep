@@ -31,8 +31,8 @@ DeepSeek  POST {DEEPSEEK_BASE_URL}/chat/completions   (src/deepseek.js)
 | `src/worker.js` | Entrypoint (`main` do wrangler): reexporta o handler e a classe `Ledger` |
 | `src/index.js` | Rotas HTTP, auth, JSON-RPC MCP, definição e execução das ferramentas, presets |
 | `src/ledger.js` | Casca do Durable Object (RPC + `alarm()`) |
-| `src/ledger-core.js` | Lógica testável: `start`, `wait`, `run`, `state`, `execute`, `summary`, `setStopped`, `reset` |
-| `src/deepseek.js` | Cliente de streaming, tabela de preços (`PRICES`) e `costOf` |
+| `src/ledger-core.js` | Lógica testável: `start`, `wait`, `run`, `state`, `execute`, `summary`, `setStopped`, `reset`, `addFiles`, `getFiles`, `getResults`, `resultText` |
+| `src/deepseek.js` | `MODEL` fixo, cliente de streaming, tabela de preços (`PRICES`) e `costOf` |
 | `src/dashboard.js` | HTML/JS do painel, servido em `GET /painel` |
 | `test/smoke.mjs` | Testes (Node ≥ 22.13, usa `node:sqlite` para simular o SQLite do DO) |
 | `wrangler.toml` | Config do Worker, vars, binding `LEDGER` e migração `new_sqlite_classes` |
@@ -47,18 +47,30 @@ DeepSeek  POST {DEEPSEEK_BASE_URL}/chat/completions   (src/deepseek.js)
 6. **Painel sem segredo no servidor.** `/painel` é HTML estático; a senha vem no fragmento (`#`), que o navegador não envia; o JS a manda como `Authorization` para `POST /painel/api` (`summary`, `stop`, `resume`, `reset`).
 7. **Paginação.** Respostas acima de 60.000 caracteres são recortadas com instrução de `offset`. O texto guardado por chamada é limitado a 1,5 M caracteres (limite de 2 MB por valor no SQLite do DO).
 8. **Custos estimados pelo preço de pico** (`PRICES` em `src/deepseek.js`). Atualize a tabela se o DeepSeek mudar os preços.
+9. **Modelo fixo.** `MODEL = "deepseek-flash"` (`src/deepseek.js`), o ID principal do **DeepSeek-V4.1-Flash** segundo a documentação oficial. Não há parâmetro `model`; qualquer valor recebido é ignorado. Não exponha escolha de modelo.
+10. **Raciocínio explícito.** `reasoning`: `off` → `thinking: {type:"disabled"}` (e só então `temperature` é enviada, porque ela não tem efeito com raciocínio ligado); `low`/`max` → `reasoning_effort`; `high` (padrão) → nada é enviado. Se a API recusar esses campos (400 citando thinking/reasoning), há uma nova tentativa sem eles.
+11. **O usuário é o Claude: poupe os tokens de saída dele.** O custo dominante de delegar é o Claude *reescrever* conteúdo (em `context`, ou ao salvar resultados). Por isso:
+    - `deepseek_upload_url` emite uma URL assinada (HMAC-SHA256 com chave derivada do `MCP_SECRET`, validade de 60 min) para `POST /u` via `curl` (multipart com vários arquivos, ou corpo cru + `X-File-Name`). Os arquivos ficam na tabela `files` (TTL de 7 dias) e são referenciados por `files: ["f12"]` / `item_files`.
+    - `use_results: [ids]` injeta resultados anteriores no contexto (encadeamento sem cópia).
+    - Todo resultado traz `raw: <URL assinada, 24 h>` para `GET /r/<id>` (download com `curl -o`); `deliver: "link"` devolve só prévia + URL.
+    - O contexto é montado no servidor (`material()` + `compose()`); no lote, o prefixo comum (tarefa + contexto comum) vem antes do item, para aproveitar o cache de contexto do DeepSeek.
+12. **Entrada tolerante.** Clientes com schema antigo mandam listas como texto. `asList`/`asIntList` aceitam `["f1"]`, `'["f1"]'` e `'f1, f2'` em `files`, `item_files`, `use_results` e `ids` (`items` só como array JSON).
+13. **Rodapé compacto:** `[ds id=N · fim=… · in=… · out=… · ≈US$ … · Ns · raw: URL]` + `[job "x": …]`. Mantenha curto: o Claude lê isso em toda chamada.
 
 ## Ferramentas MCP expostas
 
 | Nome | Entrada principal | Comportamento |
 |---|---|---|
-| `deepseek_task` | `task`, `context` | Uma chamada. `task` = `__wait__ N` → age como `deepseek_wait` |
-| `deepseek_batch` | `task`, `items[]` (≤25), `shared_context` | Uma chamada por item, em paralelo; saída `=== <step> (id N) ===` por item |
-| `deepseek_json` | `task`, `schema`, `context` | `response_format: json_object`; valida/normaliza JSON no retorno (sem nova tentativa automática) |
-| `deepseek_wait` | `ids[]`, `offset` | Espera ≤40 s por todos os ids; devolve concluídos e lista pendentes |
+| `deepseek_task` | `task`, `context` | Uma chamada. Atalhos p/ schema antigo: `task` = `__wait__ N[,M] [offset=K]` → `deepseek_wait`; `__upload_url__` → `deepseek_upload_url` |
+| `deepseek_batch` | `task`, `items[]` e/ou `item_files[]` (≤25 no total), `shared_context` | Uma chamada por item, em paralelo; saída `=== <rótulo> (i/n) · id N · raw: URL ===` |
+| `deepseek_json` | `task`, `schema`, `context` | `response_format: json_object`; valida/normaliza JSON no retorno |
+| `deepseek_wait` | `ids[]`, `offset`, `deliver` | Espera ≤40 s por todos os ids; devolve concluídos e lista pendentes; reemite links |
+| `deepseek_upload_url` | — | URL assinada (60 min) + exemplo de `curl` para enviar arquivos |
 | `deepseek_usage` | `job?` | Totais, 24 h, jobs, estado do PARAR |
 
-Comuns: `job`, `step`, `preset` (`general|code|extract|draft|translate|summarize|review`), `system`, `model` (`deepseek-flash` padrão, `deepseek-v4-pro`), `temperature`.
+Comuns (task/batch/json): `files`, `use_results`, `job`, `step`, `preset` (`general|code|extract|draft|translate|summarize|review`), `reasoning` (`off|low|high|max`), `temperature` (só com `off`), `system`, `deliver` (`inline|link`).
+
+Rotas HTTP além de `/mcp`: `GET /` (texto fixo), `GET /painel`, `POST /painel/api`, `POST /u?e&s` (upload assinado), `GET /r/<id>?e&s` (download assinado).
 
 ## Instalar para o usuário (roteiro para o agente)
 
@@ -99,4 +111,5 @@ Se o usuário usa Claude Code **sem** conta claude.ai, o servidor também pode s
 
 - Quem tem o `MCP_SECRET` gasta os créditos DeepSeek do dono. Não o registre em logs, URLs de issues ou mensagens.
 - O conteúdo enviado ao DeepSeek sai para servidores da DeepSeek. Oriente o usuário a não enviar dados pessoais/sigilosos (LGPD).
-- Endpoints sem auth: `GET /` (texto fixo) e `GET /painel` (HTML sem dados). Todo o resto exige o segredo.
+- Endpoints sem auth: `GET /` (texto fixo) e `GET /painel` (HTML sem dados). `/u` e `/r/<id>` exigem assinatura HMAC válida e não expirada; o resto exige o segredo.
+- Links `raw` (24 h) e de upload (60 min) aparecem na conversa: quem os tiver pode ler aquele resultado ou enviar arquivos até expirarem, mas **não** consegue acionar o DeepSeek (isso exige o `MCP_SECRET`). Trocar o `MCP_SECRET` invalida todos os links.

@@ -6,7 +6,6 @@ preview_urls = false
 
 [vars]
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-flash"
 
 # Livro-caixa de consumo + botão PARAR (instância única, SQLite).
 [[durable_objects.bindings]]

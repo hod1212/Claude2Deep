@@ -34,6 +34,18 @@ export class Ledger extends DurableObject {
   reset() {
     return this.core.reset();
   }
+  addFiles(files) {
+    return this.core.addFiles(files);
+  }
+  getFiles(ids) {
+    return this.core.getFiles(ids);
+  }
+  getResults(ids) {
+    return this.core.getResults(ids);
+  }
+  resultText(id) {
+    return this.core.resultText(id);
+  }
   async alarm() {
     if (this.core.active.size) await this.ctx.storage.setAlarm(Date.now() + KEEPALIVE_MS);
   }

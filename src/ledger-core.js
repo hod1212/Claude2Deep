@@ -12,6 +12,8 @@ export const STOP_MESSAGE =
   "(nem fazendo o trabalho você mesmo sem autorização): pare, relate o que foi concluído até aqui " +
   "e pergunte ao usuário como prosseguir. Ele pode clicar em Retomar no painel.";
 
+const FILE_TTL_MS = 7 * 24 * 3600 * 1000; // arquivos enviados expiram em 7 dias
+
 // Limite de texto gravado por chamada (valores no SQLite do Durable Object: até 2 MB).
 const MAX_STORED_CHARS = 1_500_000;
 function clip(text) {
@@ -34,13 +36,16 @@ export class LedgerCore {
       started INTEGER, ended INTEGER,
       in_tok INTEGER DEFAULT 0, cache_tok INTEGER DEFAULT 0, out_tok INTEGER DEFAULT 0,
       live_tok INTEGER DEFAULT 0, cost REAL DEFAULT 0, error TEXT)`);
-    // Colunas da v4 (execução assíncrona); ALTER falha se já existirem.
-    for (const col of ["kind TEXT", "finish TEXT", "result TEXT", "http_status INTEGER"]) {
+    // Colunas da v4 (execução assíncrona) e v5 (deliver); ALTER falha se já existirem.
+    for (const col of ["kind TEXT", "finish TEXT", "result TEXT", "http_status INTEGER", "deliver TEXT"]) {
       try {
         sql.exec(`ALTER TABLE calls ADD COLUMN ${col}`);
       } catch {}
     }
     sql.exec(`CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)`);
+    // Arquivos enviados pelo orquestrador (upload por URL assinada), referenciados como "f<id>".
+    sql.exec(`CREATE TABLE IF NOT EXISTS files (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, content TEXT, chars INTEGER, created INTEGER)`);
     // Chamadas que ficaram "rodando" de uma instância anterior não vão terminar.
     sql.exec(`UPDATE calls SET status = 'perdida', ended = ? WHERE status = 'rodando'`, Date.now());
   }
@@ -65,7 +70,51 @@ export class LedgerCore {
   reset() {
     if (this.active.size) return { ok: false, error: "Há chamadas em andamento." };
     this.sql.exec(`DELETE FROM calls`);
+    this.sql.exec(`DELETE FROM files`);
     return { ok: true };
+  }
+
+  // --- arquivos enviados e resultados reutilizáveis ---
+
+  /** Grava arquivos [{ name, content }] e devolve [{ file_id, name, chars }]. */
+  addFiles(files) {
+    this.sql.exec(`DELETE FROM files WHERE created < ?`, Date.now() - FILE_TTL_MS);
+    return files.map((f) => {
+      const content = clip(f.content);
+      const id = this.rows(
+        `INSERT INTO files (name, content, chars, created) VALUES (?, ?, ?, ?) RETURNING id`,
+        f.name, content, content.length, Date.now()
+      )[0].id;
+      return { file_id: `f${id}`, name: f.name, chars: content.length };
+    });
+  }
+
+  /** ids numéricos -> { found: [{ id, name, content }], missing: [id] } */
+  getFiles(ids) {
+    const found = [];
+    const missing = [];
+    for (const id of ids) {
+      const r = this.rows(`SELECT id, name, content FROM files WHERE id = ?`, id)[0];
+      r ? found.push(r) : missing.push(id);
+    }
+    return { found, missing };
+  }
+
+  /** Texto de chamadas concluídas, para reuso como contexto. */
+  getResults(ids) {
+    const found = [];
+    const missing = [];
+    for (const id of ids) {
+      const c = this.rows(`SELECT id, step, status, result FROM calls WHERE id = ?`, id)[0];
+      if (c && ["ok", "cortada", "interrompida"].includes(c.status) && c.result) found.push(c);
+      else missing.push(id);
+    }
+    return { found, missing };
+  }
+
+  /** Texto bruto de uma chamada (download). */
+  resultText(id) {
+    return this.rows(`SELECT result FROM calls WHERE id = ?`, id)[0]?.result ?? null;
   }
 
   /**
@@ -77,8 +126,9 @@ export class LedgerCore {
     const job = meta.job || "(sem job)";
     if (this.isStopped()) return { ok: false, stopped: true, error: STOP_MESSAGE, job: this.jobTotals(job) };
     const id = this.rows(
-      `INSERT INTO calls (job, step, tool, kind, model, status, started) VALUES (?, ?, ?, ?, ?, 'rodando', ?) RETURNING id`,
-      job, meta.step || "", meta.tool || "", meta.kind || "", payload.model, Date.now()
+      `INSERT INTO calls (job, step, tool, kind, deliver, model, status, started)
+       VALUES (?, ?, ?, ?, ?, ?, 'rodando', ?) RETURNING id`,
+      job, meta.step || "", meta.tool || "", meta.kind || "", meta.deliver || "inline", payload.model, Date.now()
     )[0].id;
     const ctrl = new AbortController();
     this.active.set(id, ctrl);
@@ -126,6 +176,7 @@ export class LedgerCore {
       id,
       step: c.step,
       kind: c.kind,
+      deliver: c.deliver || "inline",
       model: c.model,
       started: c.started,
       ended: c.ended,
@@ -185,6 +236,12 @@ export class LedgerCore {
     let r;
     try {
       r = await call(payload);
+      // Parâmetros de raciocínio recusados pela API: tenta de novo sem eles (modo padrão do modelo).
+      if (!r.ok && r.status === 400 && /thinking|reasoning/i.test(r.error) && (payload.thinking || payload.reasoning_effort)) {
+        const { thinking, reasoning_effort, ...rest } = payload;
+        payload = rest;
+        r = await call(payload);
+      }
       if (!r.ok && r.status === 400 && /max_tokens/i.test(r.error) && payload.max_tokens > FALLBACK_MAX_TOKENS) {
         r = await call({ ...payload, max_tokens: FALLBACK_MAX_TOKENS });
       }

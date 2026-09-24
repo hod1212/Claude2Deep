@@ -1,23 +1,39 @@
-// Servidor MCP remoto (Streamable HTTP, stateless) que expõe o DeepSeek como agente operacional.
-// O Claude orquestra e revisa; o DeepSeek executa. Todo consumo passa pelo Durable Object
-// Ledger, que registra tokens/custo e obedece ao botão PARAR do painel (/painel).
+// Servidor MCP remoto (Streamable HTTP, stateless) que expõe o DeepSeek-V4.1-Flash como agente
+// operacional do Claude. O usuário desta API é sempre o Claude: ele orquestra e revisa; o DeepSeek
+// executa. Todo consumo passa pelo Durable Object Ledger (registro, PARAR, execução assíncrona).
 //
-// MCP:    POST /mcp   (header Authorization: Bearer <MCP_SECRET>)  ou  POST /mcp/<MCP_SECRET>
-// Painel: GET  /painel#<MCP_SECRET>   (API em POST /painel/api com o mesmo header)
-// Secrets: DEEPSEEK_API_KEY, MCP_SECRET     Vars: DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+// MCP:      POST /mcp            (Authorization: Bearer <MCP_SECRET>)  ou  POST /mcp/<MCP_SECRET>
+// Painel:   GET  /painel#<MCP_SECRET>   (API: POST /painel/api com o mesmo header)
+// Upload:   POST /u?e=..&s=..    (URL assinada, emitida por deepseek_upload_url)
+// Download: GET  /r/<id>?e=..&s=.. (URL assinada, emitida em cada resultado)
+// Secrets: DEEPSEEK_API_KEY, MCP_SECRET     Vars: DEEPSEEK_BASE_URL
 
 import { DEFAULT_MAX_TOKENS, STOP_MESSAGE } from "./ledger-core.js";
+import { MODEL } from "./deepseek.js";
 import { DASHBOARD_HTML } from "./dashboard.js";
 
-const SERVER_INFO = { name: "deepseek-agent", version: "4.0.0" };
+const SERVER_INFO = { name: "deepseek-agent", version: "5.0.0" };
 const SUPPORTED_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
+// O cliente do Claude desiste de uma chamada de ferramenta após ~60 s. Por isso cada chamada
+// espera no máximo WAIT_MS; o que não terminar continua no servidor e é buscado com deepseek_wait.
+const WAIT_MS = 40000;
+const MAX_RETURN_CHARS = 60000;
+const PREVIEW_CHARS = 600;
 const BATCH_MAX_ITEMS = 25;
+const LINK_TTL_MS = 24 * 3600 * 1000;
+const UPLOAD_TTL_MS = 60 * 60 * 1000;
+const UPLOAD_MAX_FILES = 25;
+const UPLOAD_MAX_TOTAL_CHARS = 5_000_000;
+
+const REASONING = ["off", "low", "high", "max"];
+const DELIVER = ["inline", "link"];
 
 const BASE_SYSTEM =
-  "Você é um agente executor subordinado a um orquestrador (outro modelo), que revisará seu trabalho. " +
-  "Cumpra a tarefa com precisão, sem pedir esclarecimentos: se algo for ambíguo, escolha a " +
-  "interpretação mais razoável. Entregue apenas o resultado, pronto para uso, sem preâmbulos.";
+  "Você é um agente executor subordinado a um orquestrador (outro modelo de IA), que revisará seu " +
+  "trabalho. Cumpra a tarefa com precisão, sem pedir esclarecimentos: se algo for ambíguo, escolha a " +
+  "interpretação mais razoável. Entregue apenas o resultado, pronto para uso, sem preâmbulos nem " +
+  "comentários sobre o que você fez.";
 
 const PRESETS = {
   general: "",
@@ -43,51 +59,75 @@ const PRESETS = {
     "objetiva e priorizada (mais grave primeiro), citando o trecho. Não reescreva o material inteiro.",
 };
 
+// --- definição das ferramentas (o leitor destas descrições é o Claude) ---
+
 const COMMON_PROPS = {
+  files: {
+    type: "array",
+    items: { type: "string" },
+    description:
+      "Ids de arquivos enviados via deepseek_upload_url (ex.: [\"f12\",\"f13\"]). O servidor insere o " +
+      "conteúdo no contexto. Prefira isto a colar arquivos em `context`: não custa seus tokens de saída.",
+  },
+  use_results: {
+    type: "array",
+    items: { type: "integer" },
+    description:
+      "Ids de chamadas anteriores cujo resultado deve entrar como contexto (encadear etapas: " +
+      "rascunho → crítica → versão final) sem você copiar o texto.",
+  },
   job: {
     type: "string",
-    description:
-      "Nome curto do trabalho maior ao qual esta chamada pertence (ex.: 'testes-modulo-licita'). " +
-      "Use o MESMO nome em todas as subetapas: o painel agrupa o consumo por job.",
+    description: "Nome curto do trabalho (o mesmo em todas as etapas). O painel agrupa o custo por job.",
   },
-  step: {
-    type: "string",
-    description: "Rótulo da subetapa (ex.: '2/5 gerar testes de parser.py').",
-  },
+  step: { type: "string", description: "Rótulo da etapa (ex.: '2/5 testes de parser.py')." },
   preset: {
     type: "string",
     enum: Object.keys(PRESETS),
     description:
-      "Perfil do agente: general, code, extract (extração fiel), draft (rascunho), translate, " +
-      "summarize, review (crítica). Padrão: general.",
+      "Perfil do executor: code, extract (fiel à fonte, sem inventar), draft, translate, summarize, " +
+      "review (crítica priorizada), general (padrão).",
   },
-  system: { type: "string", description: "Prompt de sistema adicional; soma-se ao preset." },
-  model: {
+  reasoning: {
     type: "string",
-    description: "deepseek-flash (padrão, rápido/barato) ou deepseek-v4-pro (mais capaz, ~3x mais caro).",
+    enum: REASONING,
+    description:
+      "Raciocínio do modelo antes de responder. off = mais rápido e barato, para tarefas mecânicas " +
+      "(tradução, formatação, extração simples, conversões); high = padrão (redação, código); " +
+      "low/max = menos/mais profundidade.",
   },
   temperature: {
     type: "number",
     minimum: 0,
     maximum: 2,
-    description: "0 = determinístico (código/extração); ~1 = variado (ideias).",
+    description: "Só tem efeito com reasoning='off'. 0 = determinístico; ~1 = variado.",
+  },
+  system: { type: "string", description: "Instrução de sistema adicional; soma-se ao preset." },
+  deliver: {
+    type: "string",
+    enum: DELIVER,
+    description:
+      "inline (padrão) = texto completo na resposta. link = só prévia + URL de download (use quando " +
+      "for salvar em arquivo com curl -o e não precisar ler tudo; poupa seu contexto).",
   },
 };
 
 const TOOLS = [
   {
     name: "deepseek_task",
-    title: "DeepSeek: executar subetapa",
+    title: "DeepSeek: executar etapa",
     description:
-      "Delega UMA subetapa autocontida ao agente DeepSeek (executor rápido e barato): gerar " +
-      "código/testes, reescrever, traduzir, resumir, rascunhar, revisar. O DeepSeek NÃO vê a " +
-      "conversa, arquivos nem ferramentas: coloque em `context` tudo o que ele precisa. Informe " +
-      "`job` e `step`. Revise o resultado antes de usar.",
+      "Delega UMA etapa de execução ao DeepSeek-V4.1-Flash (barato, rápido): redigir, gerar código/" +
+      "testes/docs, traduzir, resumir, extrair, criticar. Vale a pena quando a saída esperada é muito " +
+      "maior que o que você precisa enviar; não vale para pequenas edições em arquivos grandes nem para " +
+      "raciocínio difícil ou decisões finais (faça você). O DeepSeek não vê a conversa nem arquivos: " +
+      "passe o necessário em `context`, `files` ou `use_results`. Sempre revise o resultado. " +
+      "Resposta pode vir como '⏳ AINDA EM EXECUÇÃO ids=[N]' → use deepseek_wait.",
     inputSchema: {
       type: "object",
       properties: {
-        task: { type: "string", description: "Instrução clara e completa do que fazer." },
-        context: { type: "string", description: "Material de trabalho: código, textos, dados, requisitos." },
+        task: { type: "string", description: "Instrução completa e autocontida." },
+        context: { type: "string", description: "Material curto em texto. Para arquivos, use `files`." },
         ...COMMON_PROPS,
       },
       required: ["task"],
@@ -99,27 +139,24 @@ const TOOLS = [
     name: "deepseek_batch",
     title: "DeepSeek: lote em paralelo",
     description:
-      `Aplica a MESMA instrução a vários itens independentes, em paralelo (até ${BATCH_MAX_ITEMS}). ` +
-      "Use para volume: extrair/classificar N documentos, traduzir N trechos, gerar testes para N " +
-      "funções, produzir N variações. Resultado numerado por item; falhas sinalizadas por item.",
+      `Aplica a MESMA instrução a até ${BATCH_MAX_ITEMS} itens independentes, em paralelo (uma chamada ` +
+      "por item). Itens podem ser textos (`items`) e/ou arquivos enviados (`item_files`, um item por " +
+      "arquivo). `shared_context`/`files` vão para todos os itens. Saída numerada por item, com id; " +
+      "itens pendentes são buscados com deepseek_wait.",
     inputSchema: {
       type: "object",
       properties: {
         task: { type: "string", description: "Instrução aplicada a cada item." },
-        items: {
+        items: { type: "array", items: { type: "string" }, description: "Itens em texto." },
+        item_files: {
           type: "array",
-          minItems: 1,
-          maxItems: BATCH_MAX_ITEMS,
           items: { type: "string" },
-          description: "Conteúdo de cada item.",
+          description: "Ids de arquivos enviados; cada arquivo vira um item.",
         },
-        shared_context: {
-          type: "string",
-          description: "Contexto comum enviado com todos os itens (glossário, regras, exemplos).",
-        },
+        shared_context: { type: "string", description: "Contexto comum a todos os itens." },
         ...COMMON_PROPS,
       },
-      required: ["task", "items"],
+      required: ["task"],
       additionalProperties: false,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
@@ -128,18 +165,14 @@ const TOOLS = [
     name: "deepseek_json",
     title: "DeepSeek: saída JSON",
     description:
-      "Executa uma subetapa em modo JSON e devolve o objeto validado no servidor (ou a saída bruta, " +
-      "se inválida). Use para extração estruturada e classificação. Descreva o formato em `schema` " +
-      "(exemplo ou JSON Schema).",
+      "Executa uma etapa em modo JSON e devolve o objeto já validado (ou a saída bruta, se inválida). " +
+      "Use para extração estruturada e classificação. Descreva o formato em `schema`.",
     inputSchema: {
       type: "object",
       properties: {
         task: { type: "string", description: "O que extrair/produzir." },
-        schema: {
-          type: "string",
-          description: 'Formato esperado: exemplo JSON ou JSON Schema. Ex.: {"nome": "string", "valor": 0}',
-        },
-        context: { type: "string", description: "Fonte dos dados." },
+        schema: { type: "string", description: 'Exemplo JSON ou JSON Schema. Ex.: {"nome":"string","valor":0}' },
+        context: { type: "string", description: "Fonte curta em texto. Para arquivos, use `files`." },
         ...COMMON_PROPS,
       },
       required: ["task", "schema"],
@@ -151,24 +184,15 @@ const TOOLS = [
     name: "deepseek_wait",
     title: "DeepSeek: aguardar resultado",
     description:
-      "Aguarda (até ~40 s por chamada) e devolve o resultado de execuções que ainda estavam " +
-      "rodando (resposta '⏳ AINDA EM EXECUÇÃO' com ids). Chame repetidamente até concluir; " +
-      "nunca refaça a tarefa. Também pagina textos longos: use `offset` indicado no trecho.",
+      "Aguarda até ~40 s e devolve execuções pendentes ('⏳ AINDA EM EXECUÇÃO ids=[...]'). Chame de " +
+      "novo até concluir; nunca refaça a tarefa. Também pagina textos longos (`offset`) e reemite " +
+      "links de download (`deliver`).",
     inputSchema: {
       type: "object",
       properties: {
-        ids: {
-          type: "array",
-          minItems: 1,
-          maxItems: 50,
-          items: { type: "integer" },
-          description: "Ids devolvidos pela chamada anterior.",
-        },
-        offset: {
-          type: "integer",
-          minimum: 0,
-          description: "Para textos longos (um único id): caractere a partir do qual continuar.",
-        },
+        ids: { type: "array", minItems: 1, maxItems: 50, items: { type: "integer" }, description: "Ids pendentes." },
+        offset: { type: "integer", minimum: 0, description: "Texto longo (um id): continuar deste caractere." },
+        deliver: { type: "string", enum: DELIVER, description: "Sobrepõe o modo de entrega original." },
       },
       required: ["ids"],
       additionalProperties: false,
@@ -176,11 +200,21 @@ const TOOLS = [
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
   {
+    name: "deepseek_upload_url",
+    title: "DeepSeek: URL para enviar arquivos",
+    description:
+      "Gera uma URL assinada (60 min) para você enviar arquivos de texto com curl, sem gastar tokens de " +
+      "saída copiando conteúdo. Devolve os file_ids para usar em `files` ou `item_files`. Só funciona " +
+      "onde você executa comandos (ex.: Claude Code).",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: false, openWorldHint: false },
+  },
+  {
     name: "deepseek_usage",
     title: "DeepSeek: consumo",
     description:
-      "Mostra o consumo de tokens e custo estimado do DeepSeek (total, 24h, por job) e se o " +
-      "usuário acionou PARAR no painel. Use ao planejar trabalhos grandes e entre etapas longas.",
+      "Consumo de tokens e custo estimado (total, 24 h, por job) e se o usuário acionou PARAR. " +
+      "Consulte ao planejar trabalhos grandes e entre etapas longas.",
     inputSchema: {
       type: "object",
       properties: { job: { type: "string", description: "Filtrar por um job." } },
@@ -189,6 +223,30 @@ const TOOLS = [
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
 ];
+
+function instructionsFor(origin) {
+  return [
+    "Claude2Deep: delegue EXECUÇÃO ao DeepSeek-V4.1-Flash (barato); você planeja, divide e revisa.",
+    "QUANDO USAR: saída esperada muito maior que o que você precisa enviar (rascunhos, testes, docs, " +
+      "traduções, extrações em lote). QUANDO NÃO: pequenas edições em arquivos grandes, raciocínio " +
+      "difícil, decisões finais.",
+    "ECONOMIZE SEUS TOKENS: (1) com shell disponível, envie arquivos via deepseek_upload_url + curl e " +
+      "passe `files`/`item_files` em vez de colar conteúdo; (2) encadeie etapas com `use_results` em vez " +
+      "de copiar respostas; (3) para salvar um resultado em arquivo, baixe o link `raw` com curl -o em vez " +
+      "de reescrevê-lo, e use deliver='link' quando não precisar ler o texto inteiro.",
+    "RACIOCÍNIO: reasoning='off' para tarefas mecânicas (mais rápido/barato); padrão 'high'; 'max' só " +
+      "quando necessário.",
+    "TAREFAS LONGAS: resposta '⏳ AINDA EM EXECUÇÃO ids=[..]' → chame deepseek_wait (ou deepseek_task " +
+      "com task '__wait__ N' se deepseek_wait não existir); nunca refaça. Divida só por lógica/revisão, " +
+      "com o mesmo `job` e `step` descritivo.",
+    `GASTO: não há max_tokens; o usuário acompanha em ${origin}/painel e pode PARAR. Se receber ` +
+      "INTERROMPIDO, pare e consulte o usuário.",
+    "O DeepSeek não vê a conversa nem arquivos além do que você enviar/referenciar. Não envie dados " +
+      "pessoais ou sigilosos. Revise sempre o resultado.",
+  ].join("\n");
+}
+
+// --- HTTP ---
 
 export default {
   async fetch(request, env) {
@@ -212,6 +270,14 @@ export default {
       if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
       if (!checkSecret(request.headers.get("Authorization"), env)) return json({ error: "unauthorized" }, 401);
       return handleDashboardApi(request, env);
+    }
+
+    const dl = url.pathname.match(/^\/r\/(\d+)$/);
+    if (dl && request.method === "GET") return handleDownload(Number(dl[1]), url, env);
+
+    if (url.pathname === "/u") {
+      if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+      return handleUpload(request, url, env);
     }
 
     if (!authorizedMcp(url, request, env)) {
@@ -281,6 +347,79 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
+// --- URLs assinadas (download de resultados e upload de arquivos) ---
+
+async function sign(env, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(`claude2deep-url:${secretOf(env)}`),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(message)));
+  let bin = "";
+  for (const b of mac.slice(0, 18)) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+async function signedUrl(env, origin, kind, id, ttl) {
+  const e = Date.now() + ttl;
+  const s = await sign(env, `${kind}:${id}:${e}`);
+  return kind === "r" ? `${origin}/r/${id}?e=${e}&s=${s}` : `${origin}/u?e=${e}&s=${s}`;
+}
+
+async function verifySigned(env, url, kind, id) {
+  if (!secretOf(env)) return false;
+  const e = Number(url.searchParams.get("e"));
+  const s = url.searchParams.get("s") || "";
+  if (!Number.isFinite(e) || e < Date.now()) return false;
+  return safeEqual(s, await sign(env, `${kind}:${id}:${e}`));
+}
+
+async function handleDownload(id, url, env) {
+  if (!(await verifySigned(env, url, "r", id))) {
+    return new Response("Link inválido ou expirado. Chame deepseek_wait com o id para gerar outro.", { status: 403 });
+  }
+  const text = await ledger(env).resultText(id);
+  if (text == null) return new Response("Resultado não encontrado.", { status: 404 });
+  return new Response(text, {
+    headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
+  });
+}
+
+async function handleUpload(request, url, env) {
+  if (!(await verifySigned(env, url, "u", ""))) {
+    return json({ error: "URL de upload inválida ou expirada. Chame deepseek_upload_url de novo." }, 403);
+  }
+  const files = [];
+  const type = request.headers.get("Content-Type") || "";
+  try {
+    if (type.includes("multipart/form-data")) {
+      const form = await request.formData();
+      for (const [key, value] of form.entries()) {
+        if (value && typeof value === "object" && typeof value.text === "function") {
+          files.push({ name: value.name || key, content: await value.text() });
+        } else {
+          files.push({ name: key, content: String(value) });
+        }
+      }
+    } else {
+      files.push({ name: request.headers.get("X-File-Name") || "arquivo", content: await request.text() });
+    }
+  } catch (err) {
+    return json({ error: `Não consegui ler o envio: ${err.message}` }, 400);
+  }
+  if (!files.length) return json({ error: "Nenhum arquivo recebido." }, 400);
+  if (files.length > UPLOAD_MAX_FILES) return json({ error: `Máximo de ${UPLOAD_MAX_FILES} arquivos por envio.` }, 413);
+  const total = files.reduce((a, f) => a + f.content.length, 0);
+  if (total > UPLOAD_MAX_TOTAL_CHARS) {
+    return json({ error: `Envio grande demais (${total} caracteres; máximo ${UPLOAD_MAX_TOTAL_CHARS}).` }, 413);
+  }
+  return json({ files: await ledger(env).addFiles(files) });
+}
+
 // --- painel ---
 
 function ledger(env) {
@@ -325,24 +464,12 @@ async function handle(msg, env, origin) {
   switch (method) {
     case "initialize": {
       const requested = params.protocolVersion;
-      const protocolVersion = SUPPORTED_VERSIONS.includes(requested)
-        ? requested
-        : SUPPORTED_VERSIONS[0];
+      const protocolVersion = SUPPORTED_VERSIONS.includes(requested) ? requested : SUPPORTED_VERSIONS[0];
       return rpcResult(id, {
         protocolVersion,
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
-        instructions:
-          "Agente operacional DeepSeek: você orquestra e revisa; o DeepSeek executa. " +
-          "Quebre trabalhos grandes em SUBETAPAS (uma chamada por subetapa), informando o mesmo " +
-          "`job` e um `step` descritivo em cada uma, e revise cada resultado antes de seguir. " +
-          "Não há limite de tokens por chamada (não tente definir um): o usuário acompanha o gasto ao vivo em " +
-          `${origin}/painel e pode clicar PARAR. Tarefas longas NÃO precisam ser fatiadas por ` +
-          "tempo: se a resposta vier '⏳ AINDA EM EXECUÇÃO' com ids, chame deepseek_wait com esses " +
-          "ids até concluir (a execução continua no servidor). Fatie apenas por lógica/revisão. " +
-          "Se uma ferramenta responder INTERROMPIDO, pare " +
-          "imediatamente e consulte o usuário. O DeepSeek não vê conversa, arquivos nem " +
-          "ferramentas: envie todo o contexto necessário. Nunca envie dados sensíveis/pessoais.",
+        instructions: instructionsFor(origin),
       });
     }
     case "ping":
@@ -350,104 +477,304 @@ async function handle(msg, env, origin) {
     case "tools/list":
       return rpcResult(id, { tools: TOOLS });
     case "tools/call":
-      return rpcResult(id, await callTool(params, env));
+      return rpcResult(id, await callTool(params, env, origin));
     default:
       return rpcError(id, -32601, `Method not found: ${method}`);
   }
 }
 
-// O cliente do Claude desiste de uma chamada de ferramenta após ~60 s. Por isso cada chamada
-// espera no máximo WAIT_MS; o que não terminar continua rodando no servidor e é buscado
-// depois com deepseek_wait.
-const WAIT_MS = 40000;
-const MAX_RETURN_CHARS = 60000;
+// Atalhos via deepseek_task para clientes que guardaram uma lista de ferramentas antiga:
+// task = "__wait__ 45" | "__wait__ 45,46 offset=60000" | "__upload_url__".
+const WAIT_VIA_TASK = /^\s*__wait__\s+([\d,\s]+?)(?:\s+offset=(\d+))?\s*$/;
+const UPLOAD_VIA_TASK = /^\s*__upload_url__\s*$/;
 
-async function callTool(params, env) {
+async function callTool(params, env, origin) {
   const args = params.arguments || {};
-  if (params.name === "deepseek_usage") return runUsage(args, env);
-  if (params.name === "deepseek_wait") return runWait(args, env);
+  const ctx = { env, origin };
+  switch (params.name) {
+    case "deepseek_usage":
+      return runUsage(args, ctx);
+    case "deepseek_wait":
+      return runWait(args, ctx);
+    case "deepseek_upload_url":
+      return runUploadUrl(ctx);
+  }
+
+  if (typeof args.task !== "string" || !args.task.trim()) return toolError("O argumento `task` é obrigatório.");
+  if (params.name === "deepseek_task") {
+    const w = args.task.match(WAIT_VIA_TASK);
+    if (w) {
+      const ids = w[1].split(/[\s,]+/).filter(Boolean).map(Number);
+      return runWait({ ids, offset: w[2] ? Number(w[2]) : 0 }, ctx);
+    }
+    if (UPLOAD_VIA_TASK.test(args.task)) return runUploadUrl(ctx);
+  }
 
   if (!env.DEEPSEEK_API_KEY) return toolError("DEEPSEEK_API_KEY não configurada no servidor.");
-  if (typeof args.task !== "string" || !args.task.trim()) {
-    return toolError("O argumento `task` é obrigatório.");
-  }
-  if (args.preset && !(args.preset in PRESETS)) {
-    return toolError(`preset inválido: ${args.preset}. Use: ${Object.keys(PRESETS).join(", ")}.`);
-  }
+  const bad = validateCommon(args);
+  if (bad) return toolError(bad);
+
   switch (params.name) {
     case "deepseek_task":
-      return runTask(args, env);
+      return runTask(args, ctx);
     case "deepseek_batch":
-      return runBatch(args, env);
+      return runBatch(args, ctx);
     case "deepseek_json":
-      return runJson(args, env);
+      return runJson(args, ctx);
     default:
       return toolError(`Ferramenta desconhecida: ${params.name}`);
   }
 }
 
-// Alternativa ao deepseek_wait para clientes que guardaram uma lista de ferramentas antiga
-// (só com deepseek_task): task = "__wait__ 45" ou "__wait__ 45,46 offset=60000".
-const WAIT_VIA_TASK = /^\s*__wait__\s+([\d,\s]+?)(?:\s+offset=(\d+))?\s*$/;
-
-async function runTask(args, env) {
-  const w = args.task.match(WAIT_VIA_TASK);
-  if (w) {
-    const ids = w[1].split(/[\s,]+/).filter(Boolean).map(Number);
-    return runWait({ ids, offset: w[2] ? Number(w[2]) : 0 }, env);
+function validateCommon(args) {
+  if (args.preset && !(args.preset in PRESETS)) {
+    return `preset inválido: ${args.preset}. Use: ${Object.keys(PRESETS).join(", ")}.`;
   }
-  const s = await start(env, args, "deepseek_task", withContext(args.task, args.context));
-  if (!s.ok) return failure(s);
-  return present(env, [s.id]);
+  if (args.reasoning && !REASONING.includes(args.reasoning)) {
+    return `reasoning inválido: ${args.reasoning}. Use: ${REASONING.join(", ")}.`;
+  }
+  if (args.deliver && !DELIVER.includes(args.deliver)) {
+    return `deliver inválido: ${args.deliver}. Use: ${DELIVER.join(", ")}.`;
+  }
+  return null;
 }
 
-async function runJson(args, env) {
+async function runTask(args, ctx) {
+  const m = await material(ctx.env, args);
+  if (m.error) return toolError(m.error);
+  const s = await start(ctx.env, args, "deepseek_task", compose(args.task, args.context, m.text));
+  if (!s.ok) return failure(s);
+  return present(ctx, [s.id]);
+}
+
+async function runJson(args, ctx) {
+  const m = await material(ctx.env, args);
+  if (m.error) return toolError(m.error);
   const instructions =
     `${args.task}\n\nResponda SOMENTE com um objeto JSON válido (sem markdown, sem texto fora do JSON) ` +
     `no seguinte formato:\n${args.schema}`;
-  const s = await start(env, args, "deepseek_json", withContext(instructions, args.context), { json: true });
+  const s = await start(ctx.env, args, "deepseek_json", compose(instructions, args.context, m.text), { json: true });
   if (!s.ok) return failure(s);
-  return present(env, [s.id]);
+  return present(ctx, [s.id]);
 }
 
-async function runBatch(args, env) {
-  const items = args.items;
-  if (!Array.isArray(items) || items.length === 0) return toolError("`items` deve ser uma lista não vazia.");
-  if (items.length > BATCH_MAX_ITEMS) {
-    return toolError(`Máximo de ${BATCH_MAX_ITEMS} itens por lote; divida em lotes menores.`);
+async function runBatch(args, ctx) {
+  // `items` como string só é aceito se for um array JSON (textos podem conter vírgulas).
+  let rawItems = args.items;
+  if (typeof rawItems === "string") {
+    try {
+      rawItems = JSON.parse(rawItems);
+    } catch {
+      rawItems = [rawItems];
+    }
   }
+  const items = (Array.isArray(rawItems) ? rawItems : []).map((text, i) => ({ label: `item ${i + 1}`, text: String(text) }));
+  const itemFileIds = parseFileIds(args.item_files);
+  if (itemFileIds.error) return toolError(itemFileIds.error);
+  if (itemFileIds.ids.length) {
+    const r = await ledger(ctx.env).getFiles(itemFileIds.ids);
+    if (r.missing.length) return toolError(missingFiles(r.missing));
+    for (const f of r.found) items.push({ label: f.name, text: fileBlock(f) });
+  }
+  if (!items.length) return toolError("Informe `items` e/ou `item_files`.");
+  if (items.length > BATCH_MAX_ITEMS) {
+    return toolError(`Máximo de ${BATCH_MAX_ITEMS} itens por lote (recebi ${items.length}); divida em lotes.`);
+  }
+
+  const m = await material(ctx.env, args);
+  if (m.error) return toolError(m.error);
+  const shared = [args.shared_context, m.text].filter(Boolean).join("\n\n");
+
   const ids = [];
   for (let i = 0; i < items.length; i++) {
+    // Prefixo comum (tarefa + contexto comum) primeiro: aproveita o cache de contexto do DeepSeek.
     const parts = [`## Tarefa\n${args.task}`];
-    if (args.shared_context) parts.push(`## Contexto comum\n${args.shared_context}`);
-    parts.push(`## Item ${i + 1} de ${items.length}\n${items[i]}`);
-    const step = `${args.step ? args.step + " · " : ""}item ${i + 1}/${items.length}`;
-    const s = await start(env, { ...args, step }, "deepseek_batch", parts.join("\n\n"));
+    if (shared) parts.push(`## Contexto comum\n${shared}`);
+    parts.push(`## Item ${i + 1} de ${items.length}\n${items[i].text}`);
+    const step = `${args.step ? args.step + " · " : ""}${items[i].label} (${i + 1}/${items.length})`;
+    const s = await start(ctx.env, { ...args, step }, "deepseek_batch", parts.join("\n\n"));
     if (!s.ok) {
       if (!ids.length) return failure(s);
       break; // PARAR acionado no meio do disparo: devolve o que já começou
     }
     ids.push(s.id);
   }
-  return present(env, ids, { batch: true });
+  return present(ctx, ids, { batch: true });
 }
 
-async function runWait(args, env) {
-  const ids = Array.isArray(args.ids) ? args.ids.filter((n) => Number.isInteger(n)) : [];
+async function runWait(args, ctx) {
+  const list = asIntList(args.ids);
+  const ids = Array.isArray(list) ? list : [];
   if (!ids.length) return toolError("Informe `ids`: a lista de ids devolvida pela chamada anterior.");
-  return present(env, ids, { offset: args.offset, batch: ids.length > 1 });
+  if (args.deliver && !DELIVER.includes(args.deliver)) return toolError(`deliver inválido: ${args.deliver}.`);
+  return present(ctx, ids, { offset: args.offset, batch: ids.length > 1, deliver: args.deliver });
 }
 
-/** Espera até WAIT_MS e formata o estado das chamadas `ids` para o orquestrador. */
-async function present(env, ids, { offset = 0, batch = false } = {}) {
+async function runUploadUrl(ctx) {
+  const url = await signedUrl(ctx.env, ctx.origin, "u", "", UPLOAD_TTL_MS);
+  const until = new Date(Date.now() + UPLOAD_TTL_MS).toISOString().slice(11, 16);
+  return toolText(
+    [
+      `URL de upload (válida até ${until} UTC):`,
+      url,
+      "",
+      "Envie um ou vários arquivos de texto (UTF-8); o `filename` vira o rótulo que o DeepSeek verá:",
+      `curl -s -X POST "${url}" -F "f=@src/a.py;filename=src/a.py" -F "f=@src/b.py;filename=src/b.py"`,
+      "(No PowerShell use curl.exe.) Resposta:",
+      '{"files":[{"file_id":"f12","name":"src/a.py","chars":1234}, ...]}',
+      "",
+      "Depois use `files: [\"f12\", ...]` em qualquer ferramenta (contexto) ou `item_files` no deepseek_batch " +
+        `(um item por arquivo). Até ${UPLOAD_MAX_FILES} arquivos por envio; arquivos expiram em 7 dias.`,
+    ].join("\n")
+  );
+}
+
+async function runUsage(args, ctx) {
+  const s = await ledger(ctx.env).summary();
+  const t = (x) => `${x.calls} chamadas · in=${x.in_tok} · out=${x.out_tok} · ≈US$ ${fmtUsd(x.cost)}`;
+  const lines = [
+    `Estado: ${s.stopped ? "⛔ PARADO pelo usuário (novas chamadas são recusadas)" : "liberado"}`,
+    `Total: ${t(s.total)}`,
+    `24 h: ${t(s.day)}`,
+    `Em andamento: ${s.active.length}${s.active.length ? ` (ids ${s.active.map((a) => a.id).join(", ")})` : ""}`,
+  ];
+  const jobs = args.job ? s.jobs.filter((j) => j.job === args.job) : s.jobs.slice(0, 10);
+  if (jobs.length) {
+    lines.push("Jobs:");
+    for (const j of jobs) lines.push(`- ${j.job}: ${t(j)}`);
+  }
+  lines.push(`Modelo: ${MODEL} (DeepSeek-V4.1-Flash). Custos estimados pelo preço de pico (fora do pico ≈ metade).`);
+  return toolText(lines.join("\n"));
+}
+
+// --- montagem do contexto (arquivos enviados e resultados anteriores) ---
+
+/**
+ * Aceita lista de verdade ou lista serializada como texto ('["f1","f2"]' ou 'f1, f2'): clientes com
+ * lista de ferramentas antiga (sem o parâmetro no schema) enviam o valor como string.
+ */
+function asList(v) {
+  if (v == null || Array.isArray(v)) return v;
+  if (typeof v === "number") return [v];
+  if (typeof v !== "string") return v;
+  const s = v.trim();
+  if (s.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {}
+  }
+  return s.split(/[\s,]+/).filter(Boolean);
+}
+
+function asIntList(v) {
+  const list = asList(v);
+  return Array.isArray(list) ? list.map((x) => Number(x)).filter(Number.isInteger) : list;
+}
+
+function parseFileIds(list) {
+  list = asList(list);
+  if (list == null) return { ids: [] };
+  if (!Array.isArray(list)) return { error: "`files`/`item_files` deve ser uma lista de ids (ex.: [\"f12\"])." };
+  const ids = [];
+  for (const v of list) {
+    const m = String(v).trim().match(/^f?(\d+)$/i);
+    if (!m) return { error: `Id de arquivo inválido: ${v}. Use os file_ids devolvidos pelo upload (ex.: "f12").` };
+    ids.push(Number(m[1]));
+  }
+  return { ids };
+}
+
+function missingFiles(ids) {
+  return (
+    `Arquivos não encontrados: ${ids.map((i) => "f" + i).join(", ")}. Eles expiram em 7 dias; ` +
+    "envie de novo com deepseek_upload_url."
+  );
+}
+
+function fileBlock(f) {
+  return `### Arquivo: ${f.name} (f${f.id})\n\`\`\`\n${f.content}\n\`\`\``;
+}
+
+async function material(env, args) {
+  const parts = [];
+  const fileIds = parseFileIds(args.files);
+  if (fileIds.error) return { error: fileIds.error };
+  if (fileIds.ids.length) {
+    const r = await ledger(env).getFiles(fileIds.ids);
+    if (r.missing.length) return { error: missingFiles(r.missing) };
+    parts.push(`## Arquivos\n\n${r.found.map(fileBlock).join("\n\n")}`);
+  }
+  if (args.use_results != null) {
+    const list = asIntList(args.use_results);
+    const ids = Array.isArray(list) ? list : [];
+    if (!ids.length) return { error: "`use_results` deve ser uma lista de ids de chamadas (inteiros)." };
+    const r = await ledger(env).getResults(ids);
+    if (r.missing.length) {
+      return { error: `Sem resultado utilizável para os ids: ${r.missing.join(", ")} (inexistentes, com erro ou ainda rodando).` };
+    }
+    parts.push(
+      `## Resultados de etapas anteriores\n\n` +
+        r.found.map((c) => `### Resultado da chamada ${c.id}${c.step ? ` (${c.step})` : ""}\n${c.result}`).join("\n\n")
+    );
+  }
+  return { text: parts.join("\n\n") };
+}
+
+function compose(task, context, extra) {
+  const parts = [`## Tarefa\n${task}`];
+  if (context) parts.push(`## Contexto\n${context}`);
+  if (extra) parts.push(extra);
+  return parts.length === 1 ? task : parts.join("\n\n");
+}
+
+// --- DeepSeek via Ledger ---
+
+function start(env, args, tool, userContent, { json = false } = {}) {
+  const system = [BASE_SYSTEM, PRESETS[args.preset || "general"], args.system].filter(Boolean).join("\n\n");
+  const payload = {
+    // Modelo fixo (DeepSeek-V4.1-Flash); qualquer `model` recebido é ignorado.
+    model: MODEL,
+    messages: [{ role: "system", content: system }, { role: "user", content: userContent }],
+    // Sempre o máximo do modelo: o gasto é controlado pelo usuário no painel (PARAR),
+    // nunca por limite escolhido pelo orquestrador. `max_tokens` recebido é ignorado.
+    max_tokens: DEFAULT_MAX_TOKENS,
+  };
+  const reasoning = args.reasoning || "high";
+  if (reasoning === "off") {
+    payload.thinking = { type: "disabled" };
+    if (typeof args.temperature === "number") payload.temperature = args.temperature;
+  } else if (reasoning !== "high") {
+    payload.reasoning_effort = reasoning;
+  }
+  if (json) payload.response_format = { type: "json_object" };
+  return ledger(env).start(payload, {
+    job: args.job,
+    step: args.step,
+    tool,
+    kind: json ? "json" : "",
+    deliver: args.deliver || "inline",
+  });
+}
+
+// --- apresentação dos resultados para o Claude ---
+
+/** Espera até WAIT_MS e formata o estado das chamadas `ids`. */
+async function present(ctx, ids, { offset = 0, batch = false, deliver } = {}) {
+  const { env } = ctx;
   const states = await ledger(env).wait(ids, Number(env.TEST_WAIT_MS) || WAIT_MS);
   const pending = states.filter((s) => !s.done);
   const done = states.filter((s) => s.done);
+  for (const s of done) {
+    if (s.ok || s.partial) s.raw = await signedUrl(env, ctx.origin, "r", s.id, LINK_TTL_MS);
+    if (deliver) s.deliver = deliver;
+  }
 
   if (!batch && ids.length === 1) {
     const s = states[0];
     if (!s.done) return toolText(pendingMessage(pending, s.job));
     if (!s.ok) return failure(s);
+    if (s.deliver === "link") return toolText(linkBody(s, PREVIEW_CHARS) + footer(s));
     if (s.kind === "json") return presentJson(s);
     return toolText(page(s, offset, MAX_RETURN_CHARS) + footer(s));
   }
@@ -462,7 +789,7 @@ async function present(env, ids, { offset = 0, batch = false } = {}) {
   let lastJob;
   const blocks = states.map((s) => {
     if (s.job) lastJob = s.job;
-    const label = `=== ${s.step || "chamada"} (id ${s.id})`;
+    const label = `=== ${s.step || "chamada"} · id ${s.id}`;
     if (!s.done) return `${label}: EM EXECUÇÃO (${s.live_tok || 0} tokens até agora) ===`;
     inTok += s.usage?.prompt_tokens || 0;
     outTok += s.usage?.completion_tokens || 0;
@@ -477,15 +804,19 @@ async function present(env, ids, { offset = 0, batch = false } = {}) {
     }
     const cut = s.finish === "length";
     if (cut) truncated++;
-    const body = s.kind === "json" ? jsonOrRaw(s.text) : page(s, 0, budget);
-    return `${label}${cut ? " (CORTADO)" : ""} ===\n${body}`;
+    let body;
+    if (s.deliver === "link") body = linkBody(s, 300);
+    else if (s.kind === "json") body = jsonOrRaw(s.text);
+    else body = page(s, 0, budget);
+    const raw = s.deliver === "link" ? "" : ` · raw: ${s.raw}`; // no modo link o URL já está no corpo
+    return `${label}${cut ? " (CORTADO)" : ""}${raw} ===\n${body}`;
   });
 
   const head = stopped ? `${STOP_MESSAGE}\n\n` : "";
   const tail = pending.length ? `\n\n${pendingMessage(pending)}` : "";
   const summary =
-    `\n\n---\n[deepseek: chamadas=${states.length}, concluídas=${done.length - failed}, erros=${failed - stopped}, ` +
-    `interrompidas=${stopped}, em execução=${pending.length}, cortadas=${truncated}, in=${inTok}, out=${outTok}, ` +
+    `\n\n[ds lote · ${states.length} chamadas · ok=${done.length - failed} · erro=${failed - stopped} · ` +
+    `interrompidas=${stopped} · pendentes=${pending.length} · cortadas=${truncated} · in=${inTok} · out=${outTok} · ` +
     `≈US$ ${fmtUsd(cost)}]` +
     jobLine(lastJob);
   return {
@@ -498,7 +829,7 @@ function presentJson(s) {
   const parsed = tryParseJson(s.text);
   if (parsed === undefined) {
     return toolError(
-      `O DeepSeek não produziu JSON válido. Revise a saída abaixo ou refaça a subetapa com instruções mais claras.\n` +
+      "O DeepSeek não produziu JSON válido. Revise a saída abaixo ou refaça a etapa com instruções mais claras.\n" +
         `Saída:\n${s.text.slice(0, MAX_RETURN_CHARS)}${footer(s)}`
     );
   }
@@ -510,6 +841,17 @@ function jsonOrRaw(text) {
   return parsed === undefined ? `(JSON inválido)\n${text}` : JSON.stringify(parsed, null, 2);
 }
 
+function linkBody(s, previewChars) {
+  const text = s.text || "";
+  const more = text.length > previewChars ? "\n[…]" : "";
+  return (
+    `[Entregue por link: ${text.length} caracteres. Baixe com: curl -s -o ARQUIVO "${s.raw}" ` +
+    `(ou deepseek_wait ids=[${s.id}] deliver="inline" para ler aqui). Prévia:]\n` +
+    text.slice(0, previewChars) +
+    more
+  );
+}
+
 /** Recorta textos grandes e explica como buscar o resto. */
 function page(s, offset, limit) {
   const text = s.text || "";
@@ -519,65 +861,22 @@ function page(s, offset, limit) {
   if (from === 0 && to === text.length) return chunk;
   const more =
     to < text.length
-      ? ` Para continuar, chame deepseek_wait com ids=[${s.id}] e offset=${to} ` +
-        `(ou deepseek_task com task="__wait__ ${s.id} offset=${to}").`
+      ? ` Continue com deepseek_wait ids=[${s.id}] offset=${to} (ou deepseek_task task="__wait__ ${s.id} offset=${to}"), ` +
+        "ou baixe tudo pelo link raw."
       : "";
   return `${chunk}\n\n[Trecho: caracteres ${from}–${to} de ${text.length}.${more}]`;
 }
 
 function pendingMessage(pending, job) {
-  const ids = pending.map((s) => s.id);
+  const ids = pending.map((s) => s.id).join(", ");
   const live = pending.reduce((a, s) => a + (s.live_tok || 0), 0);
   return (
-    `⏳ AINDA EM EXECUÇÃO no servidor: ids=[${ids.join(", ")}] (${live} tokens gerados até agora). ` +
-    `Chame deepseek_wait com ids=[${ids.join(", ")}] para continuar aguardando (cada espera dura até ` +
-    `${WAIT_MS / 1000} s). Se deepseek_wait não estiver disponível, chame deepseek_task com ` +
-    `task="__wait__ ${ids.join(",")}" (mesmo efeito). NÃO refaça a tarefa nem a execute por conta ` +
-    `própria: o resultado não se perde. Cada id é UMA chamada; o total do job abaixo soma todas. ` +
-    `O usuário acompanha o gasto no painel e pode PARAR.` +
+    `⏳ AINDA EM EXECUÇÃO no servidor: ids=[${ids}] (${live} tokens gerados até agora). ` +
+    `Chame deepseek_wait com ids=[${ids}] (espera até ${WAIT_MS / 1000} s por chamada; repita até concluir). ` +
+    `Sem deepseek_wait na sua lista: deepseek_task com task="__wait__ ${ids.replace(/ /g, "")}". ` +
+    "NÃO refaça a tarefa nem a execute por conta própria: o resultado não se perde." +
     jobLine(job)
   );
-}
-
-async function runUsage(args, env) {
-  const s = await ledger(env).summary();
-  const lines = [
-    `Estado: ${s.stopped ? "⛔ PARADO pelo usuário (novas chamadas serão recusadas)" : "▶ liberado"}`,
-    `Total: ${s.total.calls} chamadas, in=${s.total.in_tok}, out=${s.total.out_tok}, ≈US$ ${fmtUsd(s.total.cost)}`,
-    `Últimas 24h: ${s.day.calls} chamadas, in=${s.day.in_tok}, out=${s.day.out_tok}, ≈US$ ${fmtUsd(s.day.cost)}`,
-    `Em andamento: ${s.active.length}${s.active.length ? ` (ids: ${s.active.map((a) => a.id).join(", ")})` : ""}`,
-  ];
-  const jobs = args.job ? s.jobs.filter((j) => j.job === args.job) : s.jobs.slice(0, 10);
-  if (jobs.length) {
-    lines.push("", "Jobs:");
-    for (const j of jobs) {
-      lines.push(`- ${j.job}: ${j.calls} chamadas, in=${j.in_tok}, out=${j.out_tok}, ≈US$ ${fmtUsd(j.cost)}`);
-    }
-  }
-  lines.push("", "Custos estimados pelo preço de pico (fora do pico ≈ metade).");
-  return toolText(lines.join("\n"));
-}
-
-// --- DeepSeek via Ledger ---
-
-function start(env, args, tool, userContent, { json = false } = {}) {
-  const system = [BASE_SYSTEM, PRESETS[args.preset || "general"], args.system].filter(Boolean).join("\n\n");
-  const payload = {
-    model: args.model || env.DEEPSEEK_MODEL || "deepseek-flash",
-    messages: [{ role: "system", content: system }, { role: "user", content: userContent }],
-    // Sempre o máximo do modelo: o gasto é controlado pelo usuário no painel (PARAR),
-    // nunca por limite escolhido pelo orquestrador. `max_tokens` recebido é ignorado.
-    max_tokens: DEFAULT_MAX_TOKENS,
-  };
-  if (typeof args.temperature === "number") payload.temperature = args.temperature;
-  if (json) payload.response_format = { type: "json_object" };
-  return ledger(env).start(payload, { job: args.job, step: args.step, tool, kind: json ? "json" : "" });
-}
-
-// --- utilitários ---
-
-function withContext(task, context) {
-  return context ? `## Tarefa\n${task}\n\n## Contexto\n${context}` : task;
 }
 
 function failure(r) {
@@ -591,10 +890,11 @@ function failure(r) {
 function footer(r) {
   const u = r.usage || {};
   const warn = r.finish === "length" ? "\n⚠ Resposta CORTADA pelo limite do modelo." : "";
-  const secs = r.ended && r.started ? `, tempo=${Math.round((r.ended - r.started) / 1000)}s` : "";
+  const secs = r.ended && r.started ? ` · ${Math.round((r.ended - r.started) / 1000)}s` : "";
+  const raw = r.raw ? ` · raw: ${r.raw}` : "";
   return (
-    `${warn}\n\n---\n[deepseek: id=${r.id}, model=${r.model}, finish=${r.finish}, in=${u.prompt_tokens ?? "?"}, ` +
-    `out=${u.completion_tokens ?? "?"}, ≈US$ ${fmtUsd(r.cost)}${secs}]` +
+    `${warn}\n\n[ds id=${r.id} · fim=${r.finish} · in=${u.prompt_tokens ?? "?"} · out=${u.completion_tokens ?? "?"} · ` +
+    `≈US$ ${fmtUsd(r.cost)}${secs}${raw}]` +
     jobLine(r.job)
   );
 }
@@ -602,10 +902,7 @@ function footer(r) {
 function jobLine(job) {
   // Sem job nomeado, o acumulado misturaria chamadas sem relação entre si.
   if (!job || !job.calls || job.name === "(sem job)") return "";
-  return (
-    `\n[acumulado do job "${job.name}": ${job.calls} chamadas, in=${job.in_tok}, out=${job.out_tok}, ` +
-    `≈US$ ${fmtUsd(job.cost)}]`
-  );
+  return `\n[job "${job.name}": ${job.calls} chamadas · in=${job.in_tok} · out=${job.out_tok} · ≈US$ ${fmtUsd(job.cost)}]`;
 }
 
 function fmtUsd(v) {

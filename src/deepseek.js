@@ -1,13 +1,15 @@
 // Cliente de streaming do DeepSeek (API compatível com OpenAI) e tabela de preços.
 
+// Modelo fixo: "deepseek-flash" é o ID principal do DeepSeek-V4.1-Flash.
+export const MODEL = "deepseek-flash";
+
 // USD por 1M de tokens, preço de PICO (estimativa conservadora). Fora do pico é metade.
 export const PRICES = {
   "deepseek-flash": { hit: 0.006, miss: 0.3, out: 1.2 },
-  "deepseek-v4-pro": { hit: 0.044, miss: 1.32, out: 3.96 },
 };
 
-export function priceFor(model) {
-  return PRICES[model] || (/pro/i.test(model || "") ? PRICES["deepseek-v4-pro"] : PRICES["deepseek-flash"]);
+export function priceFor() {
+  return PRICES[MODEL];
 }
 
 export function costOf(model, usage = {}) {
@@ -42,36 +44,42 @@ export async function streamChat({ fetchFn = fetch, baseUrl, apiKey, payload, si
   let finish;
   let model = payload.model;
   let usage;
+  // acc.est conta pedaços do stream: é só uma estimativa para o contador ao vivo do painel;
+  // o custo final usa o `usage` oficial devolvido pela API.
+  const handleLine = (raw) => {
+    const line = raw.trim();
+    if (!line.startsWith("data:")) return;
+    const data = line.slice(5).trim();
+    if (data === "[DONE]") return;
+    let j;
+    try {
+      j = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (j.model) model = j.model;
+    if (j.usage) usage = j.usage;
+    const c = j.choices?.[0];
+    if (!c) return;
+    const d = c.delta || {};
+    if (d.content) {
+      acc.text += d.content;
+      acc.est++;
+    }
+    if (d.reasoning_content) acc.est++;
+    if (c.finish_reason) finish = c.finish_reason;
+  };
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
     buf += value;
     let nl;
     while ((nl = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, nl).trim();
+      handleLine(buf.slice(0, nl));
       buf = buf.slice(nl + 1);
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim();
-      if (data === "[DONE]") continue;
-      let j;
-      try {
-        j = JSON.parse(data);
-      } catch {
-        continue;
-      }
-      if (j.model) model = j.model;
-      if (j.usage) usage = j.usage;
-      const c = j.choices?.[0];
-      if (!c) continue;
-      const d = c.delta || {};
-      if (d.content) {
-        acc.text += d.content;
-        acc.est++;
-      }
-      if (d.reasoning_content) acc.est++;
-      if (c.finish_reason) finish = c.finish_reason;
     }
     onProgress?.(acc.est);
   }
+  if (buf) handleLine(buf); // último evento sem quebra de linha final
   return { ok: true, text: acc.text, finish, model, usage: usage || { completion_tokens: acc.est } };
 }

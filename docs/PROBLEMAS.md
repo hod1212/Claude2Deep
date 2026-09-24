@@ -12,7 +12,7 @@ Os comandos são digitados no **terminal** (PowerShell no Windows, Terminal no M
 
 - Durante a instalação: [1](#1-o-endereço-workersdev-não-abre-depois-de-publicar) · [2](#2-erro-no-powershell-a-execução-de-scripts-foi-desabilitada-neste-sistema) · [3](#3-node-npm-ou-git-não-é-reconhecido-como-comando)
 - Ao conectar no Claude: [4](#4-não-foi-possível-alcançar-deepseek-agent-ao-clicar-em-vincular) · [5](#5-404-ou-não-foi-possível-verificar-o-servidor-ao-adicionar-o-conector)
-- Durante o uso: [6](#6-o-claude-só-mostra-a-ferramenta-deepseek_task-lista-antiga) · [7](#7-resposta--ainda-em-execução--idsn) · [8](#8-resposta--interrompido-pelo-usuário) · [9](#9-erro-401-chave-inválida-ou-erro-de-saldo) · [10](#10-ver-os-registros-do-servidor-ao-vivo-avançado)
+- Durante o uso: [6](#6-o-claude-só-mostra-a-ferramenta-deepseek_task-lista-antiga) · [7](#7-resposta--ainda-em-execução--idsn) · [8](#8-resposta--interrompido-pelo-usuário) · [9](#9-erro-401-chave-inválida-ou-erro-de-saldo) · [9b](#9b-link-inválido-ou-expirado-ou-url-de-upload-inválida-ou-expirada) · [10](#10-ver-os-registros-do-servidor-ao-vivo-avançado)
 - Painel: [11](#11-painel-diz-senha-incorreta) · [12](#12-status-perdida-no-painel)
 
 ---
@@ -162,6 +162,16 @@ Ou seja: sempre `npm.cmd` no lugar de `npm` e `npx.cmd` no lugar de `npx`.
   ```
   Não precisa publicar de novo: vale na hora.
 - **Saldo:** recarregue em [platform.deepseek.com](https://platform.deepseek.com).
+
+### 9b. "Link inválido ou expirado" ou "URL de upload inválida ou expirada"
+
+**Sintoma:** o Claude tenta baixar um resultado (link `raw`) ou enviar arquivos e recebe erro 403 com essa mensagem.
+
+**Por que acontece:** os links são temporários por segurança: download vale 24 h, envio vale 60 min. Trocar a senha do servidor também invalida todos os links.
+
+**Como resolver:** peça ao Claude um link novo. Para download: *"chame deepseek_wait com o id N"*. Para envio: *"gere outra URL de upload"*. Se o Claude disser que um arquivo `fN` "não foi encontrado", é porque os arquivos enviados expiram em 7 dias: basta enviar de novo.
+
+> No PowerShell do Windows, `curl` é um apelido de outro comando. O Claude deve usar `curl.exe`. No Claude Code isso normalmente já é resolvido sozinho.
 
 ### 10. Ver os registros do servidor ao vivo (avançado)
 

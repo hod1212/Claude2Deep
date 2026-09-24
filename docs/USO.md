@@ -48,27 +48,29 @@ O conector fica **atrelado à sua conta Claude**: funciona no claude.ai, no apli
 A resposta traz um rodapé técnico como este:
 
 ```
-[deepseek: id=1, model=deepseek-flash, finish=stop, in=120, out=15, ≈US$ 0.0000, tempo=2s]
+[ds id=1 · fim=stop · in=120 · out=15 · ≈US$ 0.0000 · 2s · raw: https://deepseek-mcp.SEU-SUBDOMINIO.workers.dev/r/1?e=…&s=…]
 ```
 
 | Campo | Significado |
 |---|---|
 | `id` | Número da chamada (aparece também no painel) |
-| `model` | Modelo usado |
-| `finish` | `stop` = terminou normalmente; `length` = foi cortada pelo limite do modelo |
-| `in` / `out` | Tokens de entrada (o que foi enviado) e de saída (o que foi gerado) |
+| `fim` | `stop` = terminou normalmente; `length` = foi cortada pelo limite do modelo |
+| `in` / `out` | Tokens de entrada (o que foi enviado) e de saída (o que foi gerado, incluindo o raciocínio) |
 | `≈US$` | Custo estimado da chamada |
-| `tempo` | Quanto o DeepSeek levou |
+| `2s` | Quanto o DeepSeek levou |
+| `raw` | Link temporário (24 h) para baixar o texto completo, usado pelo Claude para salvar resultados em arquivo |
 
-Quando você usa um **job** (veja abaixo), aparece também o acumulado daquele trabalho.
+Quando há um **job** (veja abaixo), aparece também o acumulado daquele trabalho.
 
-> **Diferença entre chat e Claude Code:** no Claude Code, o Claude lê e edita os arquivos do seu projeto, e manda ao DeepSeek só o necessário. No chat, você cola ou anexa o material na conversa.
+**Modelo:** o Claude2Deep usa **sempre o DeepSeek-V4.1-Flash** (identificador `deepseek-flash`), o melhor custo-benefício atual. Não há como escolher outro modelo: é uma decisão a menos para o Claude, e o custo fica previsível.
+
+> **Diferença entre chat e Claude Code:** no Claude Code, o Claude lê seus arquivos e pode enviá-los ao DeepSeek **por link**, sem gastar tokens copiando o conteúdo (veja "Como o Claude economiza"). No chat, você cola ou anexa o material na conversa.
 
 ---
 
 ## As ferramentas
 
-O Claude ganha cinco ferramentas. **Você não precisa digitar os nomes**: basta descrever o que quer, e o Claude escolhe. Os nomes ajudam quando você quer ser específico.
+O Claude ganha seis ferramentas. **Você não precisa digitar os nomes**: basta descrever o que quer, e o Claude escolhe. Os nomes ajudam quando você quer ser específico.
 
 | Ferramenta | Para que serve | Exemplo de pedido |
 |---|---|---|
@@ -76,6 +78,7 @@ O Claude ganha cinco ferramentas. **Você não precisa digitar os nomes**: basta
 | **deepseek_batch** | A **mesma** instrução para até **25 itens** ao mesmo tempo. | "Traduza estes 20 parágrafos para o inglês usando o DeepSeek em lote." |
 | **deepseek_json** | Resposta em **JSON** (dados organizados, que o Claude transforma em tabela). | "Use o DeepSeek para extrair partes, valor e vigência destes contratos." |
 | **deepseek_wait** | Busca o resultado de tarefas demoradas e pega textos grandes em partes. | O Claude usa sozinho quando precisa. |
+| **deepseek_upload_url** | Gera um link para o Claude enviar arquivos ao servidor com `curl` (Claude Code). | O Claude usa sozinho: "gere testes para os arquivos de src/". |
 | **deepseek_usage** | Mostra quanto já foi gasto e se o PARAR está ativo. | "Quanto já gastei com o DeepSeek hoje?" |
 
 ---
@@ -104,16 +107,35 @@ Nada disso é obrigatório: o Claude escolhe por você. Mas você pode mencionar
 
 *"Use o preset extract."*
 
-**model: qual DeepSeek usar.**
-- **deepseek-flash** (padrão): rápido e barato.
-- **deepseek-v4-pro**: mais capaz, cerca de **3 vezes mais caro**. Para tarefas mais difíceis.
+**reasoning: quanto o DeepSeek "pensa" antes de responder.**
 
-*"Use o modelo pro nesta parte."*
+| Valor | Quando usar |
+|---|---|
+| `off` | Tarefas mecânicas: traduzir, formatar, converter, extrair dados simples. **Bem mais rápido e barato.** |
+| `low` | Tarefas simples que ainda pedem um pouco de análise |
+| `high` | Padrão: redação, código, revisão |
+| `max` | O que exige mais profundidade |
 
-**temperature: criatividade.** `0` = preciso, sem invenção (bom para código e extração). Perto de `1` = mais criativo (bom para ideias).
-*"Faça com temperatura 0."*
+Exemplo real: resumir um texto com `off` levou 1 s e custou US$ 0,0002. Uma revisão de código com `low` levou 6 s e US$ 0,0017, porque o raciocínio também conta como tokens de saída.
+*"Traduza com o raciocínio desligado."*
+
+**temperature: criatividade.** Só vale com o raciocínio desligado (`off`). `0` = preciso; perto de `1` = mais variado.
 
 **system: regra extra**, somada ao preset. *"Oriente o DeepSeek a escrever em linguagem jurídica formal."*
+
+**deliver: como o resultado volta.** `inline` (padrão) traz o texto completo. `link` traz só uma prévia e o link de download, útil quando o Claude vai salvar o texto num arquivo e não precisa lê-lo inteiro.
+
+---
+
+## Como o Claude economiza
+
+Cada palavra que o Claude **escreve** custa caro para o seu plano. Por isso o Claude2Deep evita que ele reescreva conteúdo:
+
+- **Arquivos por link (Claude Code):** em vez de copiar o conteúdo de um arquivo para dentro do pedido, o Claude pede um link de envio (`deepseek_upload_url`), manda os arquivos com um comando `curl` e passa só os ids (`files: ["f12"]`). Para "gere testes para cada arquivo de src/", usa `item_files`: um item do lote por arquivo.
+- **Reaproveitar resultados (`use_results`):** para encadear etapas (rascunho → crítica → versão final), o Claude passa o id da etapa anterior, e o servidor insere o texto sozinho.
+- **Salvar sem reescrever:** para gravar um resultado num arquivo, o Claude baixa pelo link `raw` com `curl -o`, em vez de digitar o texto de novo.
+
+Você não precisa pedir nada disso: o servidor explica essas técnicas ao Claude. Mas pode reforçar: *"envie os arquivos por link em vez de colar"*.
 
 ---
 
@@ -165,14 +187,15 @@ A parte depois do `#` fica só no seu navegador; ela não é enviada ao servidor
 
 ## Quanto custa
 
-Preços do DeepSeek em **dólares por 1 milhão de tokens**, no horário de **pico** (o mais caro):
+Preços do DeepSeek-V4.1-Flash em **dólares por 1 milhão de tokens**:
 
-| Modelo | Entrada | Saída |
+| | Pico | Fora do pico |
 |---|---|---|
-| **deepseek-flash** (padrão) | US$ 0,30 | US$ 1,20 |
-| **deepseek-v4-pro** | US$ 1,32 | US$ 3,96 |
+| Entrada (repetida, em cache) | US$ 0,006 | US$ 0,003 |
+| Entrada (nova) | US$ 0,30 | US$ 0,15 |
+| Saída (inclui raciocínio) | US$ 1,20 | US$ 0,60 |
 
-- **Fora do pico custa metade.** O pico é das **01:00 às 04:00** e das **06:00 às 10:00 UTC**, em dias úteis (no horário de Brasília, UTC−3: **22:00–01:00** e **03:00–07:00**).
+- O pico é das **01:00 às 04:00** e das **06:00 às 10:00 UTC**, em dias úteis (no horário de Brasília, UTC−3: **22:00–01:00** e **03:00–07:00**).
 - O painel estima pelo preço de pico, então o gasto real tende a ser **igual ou menor**. O valor oficial fica em [platform.deepseek.com](https://platform.deepseek.com).
 - "Token" é um pedaço de palavra. Um texto de 10 páginas tem alguns milhares de tokens.
 - **Exemplos reais:** um conto de ~5.400 tokens custou **≈ US$ 0,007**; três guias completos deste repositório (~18 mil tokens de saída) custaram **≈ US$ 0,026**.
@@ -224,7 +247,7 @@ Lembre que o **Claude também consome** o seu plano ao orquestrar e revisar.
 > Peça ao DeepSeek 200 linhas de dados fictícios de clientes (nome, cidade, data de cadastro, valor) em CSV, para testar minha planilha.
 
 **9. Segunda opinião**
-> Peça ao DeepSeek, modelo pro e preset review, uma crítica deste plano de projeto. Depois diga quais críticas procedem.
+> Peça ao DeepSeek, com preset review e raciocínio max, uma crítica deste plano de projeto. Depois diga quais críticas procedem.
 
 **10. Consumo**
 > Quanto já gastei com o DeepSeek hoje? E no job 'artigo-tema'?

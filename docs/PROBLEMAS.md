@@ -12,7 +12,7 @@ Os comandos são digitados no **terminal** (PowerShell no Windows, Terminal no M
 
 - Durante a instalação: [1](#1-o-endereço-workersdev-não-abre-depois-de-publicar) · [2](#2-erro-no-powershell-a-execução-de-scripts-foi-desabilitada-neste-sistema) · [3](#3-node-npm-ou-git-não-é-reconhecido-como-comando)
 - Ao conectar no Claude: [4](#4-não-foi-possível-alcançar-deepseek-agent-ao-clicar-em-vincular) · [5](#5-404-ou-não-foi-possível-verificar-o-servidor-ao-adicionar-o-conector)
-- Durante o uso: [6](#6-o-claude-só-mostra-a-ferramenta-deepseek_task-lista-antiga) · [7](#7-resposta--ainda-em-execução--idsn) · [8](#8-resposta--interrompido-pelo-usuário) · [9](#9-erro-401-chave-inválida-ou-erro-de-saldo) · [9b](#9b-link-inválido-ou-expirado-ou-url-de-upload-inválida-ou-expirada) · [10](#10-ver-os-registros-do-servidor-ao-vivo-avançado)
+- Durante o uso: [6](#6-o-claude-só-mostra-a-ferramenta-deepseek_task-lista-antiga) · [7](#7-resposta--ainda-em-execução--idsn) · [8](#8-resposta--interrompido-pelo-usuário) · [9](#9-erro-401-chave-inválida-ou-erro-de-saldo) · [9b](#9b-link-inválido-ou-expirado-ou-url-de-upload-inválida-ou-expirada) · [9c](#9c-é-um-vídeo-ou-heicavif-formato-que-o-deepseek-não-aceita) · [9d](#9d-logo-depois-de-atualizar-algo-funciona-pela-metade) · [10](#10-ver-os-registros-do-servidor-ao-vivo-avançado)
 - Painel: [11](#11-painel-diz-senha-incorreta) · [12](#12-status-perdida-no-painel)
 
 ---
@@ -172,6 +172,22 @@ Ou seja: sempre `npm.cmd` no lugar de `npm` e `npx.cmd` no lugar de `npx`.
 **Como resolver:** peça ao Claude um link novo. Para download: *"chame deepseek_wait com o id N"*. Para envio: *"gere outra URL de upload"*. Se o Claude disser que um arquivo `fN` "não foi encontrado", é porque os arquivos enviados expiram em 7 dias: basta enviar de novo.
 
 > No PowerShell do Windows, `curl` é um apelido de outro comando. O Claude deve usar `curl.exe`. No Claude Code isso normalmente já é resolvido sozinho.
+
+### 9c. "é um vídeo" ou "HEIC/AVIF, formato que o DeepSeek não aceita"
+
+**Sintoma:** ao enviar um arquivo, o Claude recebe erro 415 dizendo que é vídeo, ou que é HEIC/AVIF.
+
+**Por que acontece:** o DeepSeek só aceita imagens JPEG, PNG, GIF e WebP. Vídeo e fotos HEIC/AVIF (padrão do iPhone) não são aceitos.
+
+**Como resolver:** a própria mensagem traz o comando. Para vídeo, extraia quadros e envie como imagens (veja [USO.md](USO.md#imagens-e-vídeo)). Para HEIC/AVIF, converta para JPEG. As duas coisas precisam do programa `ffmpeg` instalado ([ffmpeg.org](https://ffmpeg.org)); o Claude Code faz a conversão sozinho se ele estiver disponível.
+
+### 9d. Logo depois de atualizar, algo funciona "pela metade"
+
+**Sintoma:** logo após um `npx wrangler deploy`, um recurso novo se comporta como na versão antiga (por exemplo, uma imagem enviada volta sem `"kind":"image"`).
+
+**Por que acontece:** o Cloudflare troca a parte principal do servidor na hora, mas o "livro-caixa" (Durable Object) pode levar alguns minutos para reiniciar com o código novo.
+
+**Como resolver:** espere 2 a 5 minutos e tente de novo.
 
 ### 10. Ver os registros do servidor ao vivo (avançado)
 

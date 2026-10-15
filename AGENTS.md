@@ -55,7 +55,8 @@ DeepSeek  POST {DEEPSEEK_BASE_URL}/chat/completions   (src/deepseek.js)
     - Todo resultado traz `raw: <URL assinada, 24 h>` para `GET /r/<id>` (download com `curl -o`); `deliver: "link"` devolve só prévia + URL.
     - O contexto é montado no servidor (`material()` + `compose()`); no lote, o prefixo comum (tarefa + contexto comum) vem antes do item, para aproveitar o cache de contexto do DeepSeek.
 12. **Entrada tolerante.** Clientes com schema antigo mandam listas como texto. `asList`/`asIntList` aceitam `["f1"]`, `'["f1"]'` e `'f1, f2'` em `files`, `item_files`, `use_results` e `ids` (`items` só como array JSON).
-13. **Rodapé compacto:** `[ds id=N · fim=… · in=… · out=… · ≈US$ … · Ns · raw: URL]` + `[job "x": …]`. Mantenha curto: o Claude lê isso em toda chamada.
+13. **Imagens (v6).** O upload detecta o tipo pelos *bytes* (`sniff()`), não pela extensão: JPEG/PNG/GIF/WebP viram `kind='image'`, guardados em base64 em pedaços de 1 M caracteres (`file_chunks`; valores do SQLite do DO têm limite de 2 MB). Vídeo (MP4/MOV/WebM/AVI) e HEIC/AVIF são recusados com 415 e instruções (extrair quadros com ffmpeg / converter para JPEG). Com imagens, o `content` do usuário vira lista `[{type:"text"}, {type:"image_url", image_url:{url}}...]` (data URL ou http(s)), **na ordem pedida**, e o texto ganha a lista "Imagens anexadas (na ordem)". Imagens em `files` são roteadas como imagem automaticamente; em `item_files`, cada imagem vira um item. Limites: 10 MB por imagem, 40 MB por envio, 50 imagens por chamada. Validado com o DeepSeek real (raciocínio `off` e padrão).
+14. **Rodapé compacto:** `[ds id=N · fim=… · in=… · out=… · ≈US$ … · Ns · raw: URL]` + `[job "x": …]`. Mantenha curto: o Claude lê isso em toda chamada.
 
 ## Ferramentas MCP expostas
 
@@ -68,7 +69,7 @@ DeepSeek  POST {DEEPSEEK_BASE_URL}/chat/completions   (src/deepseek.js)
 | `deepseek_upload_url` | — | URL assinada (60 min) + exemplo de `curl` para enviar arquivos |
 | `deepseek_usage` | `job?` | Totais, 24 h, jobs, estado do PARAR |
 
-Comuns (task/batch/json): `files`, `use_results`, `job`, `step`, `preset` (`general|code|extract|draft|translate|summarize|review`), `reasoning` (`off|low|high|max`), `temperature` (só com `off`), `system`, `deliver` (`inline|link`).
+Comuns (task/batch/json): `images`, `files`, `use_results`, `job`, `step`, `preset` (`general|code|extract|draft|translate|summarize|review`), `reasoning` (`off|low|high|max`), `temperature` (só com `off`), `system`, `deliver` (`inline|link`).
 
 Rotas HTTP além de `/mcp`: `GET /` (texto fixo), `GET /painel`, `POST /painel/api`, `POST /u?e&s` (upload assinado), `GET /r/<id>?e&s` (download assinado).
 
@@ -98,6 +99,7 @@ Se o usuário usa Claude Code **sem** conta claude.ai, o servidor também pode s
 - "Não foi possível alcançar" no Vincular → quase sempre header/senha divergentes (ver acima).
 - Ferramentas novas não aparecem no cliente → lista cacheada; reconectar o conector; fallback `__wait__`.
 - Chamadas `perdida` → o DO reiniciou (ex.: deploy durante execução).
+- Logo após um `wrangler deploy`, o Worker já roda o código novo, mas a instância do Durable Object pode levar **alguns minutos** para ser trocada. Sintoma: respostas misturando comportamento novo (Worker) e antigo (DO), como upload de imagem voltando sem `kind`. Espere e repita antes de investigar.
 
 ## Desenvolvimento
 

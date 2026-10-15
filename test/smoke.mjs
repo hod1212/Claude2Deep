@@ -239,6 +239,58 @@ assert.equal(calls.length, 2);
 assert.match(text(res), /=== src\/a\.py \(1\/2\) · id \d+ · raw: https:\/\/x\.dev\/r\/\d+\?[^ ]+ ===\ntestes para src\/a\.py/);
 assert.match(text(res), /=== src\/b\.py \(2\/2\) · id \d+ · raw: [^ ]+ ===\ntestes para src\/b\.py/);
 
+// --- imagens ---
+const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+const bigJpeg = new Uint8Array(2_500_000); bigJpeg.set([0xff, 0xd8, 0xff, 0xe0]); bigJpeg[2_499_999] = 0xd9; // > 1 pedaço
+const mp4 = new Uint8Array([0, 0, 0, 0x20, ...new TextEncoder().encode("ftypisom"), 0, 0]);
+const heic = new Uint8Array([0, 0, 0, 0x18, ...new TextEncoder().encode("ftypheic"), 0, 0]);
+const upForm = (...files) => { const f = new FormData(); for (const [b, n] of files) f.append("f", new File([b], n)); return f; };
+up = await worker.fetch(new Request(upUrl, { method: "POST", body: upForm([png, "tela.png"], [bigJpeg, "foto.jpg"]) }), env);
+assert.equal(up.status, 200);
+const imgs = (await up.json()).files;
+assert.deepEqual(imgs.map((f) => [f.kind, f.mime]), [["image", "image/png"], ["image", "image/jpeg"]]);
+up = await worker.fetch(new Request(upUrl, { method: "POST", body: upForm([mp4, "clip.mp4"]) }), env);
+assert.equal(up.status, 415);
+assert.match((await up.json()).error, /vídeo.*ffmpeg/s);
+up = await worker.fetch(new Request(upUrl, { method: "POST", body: upForm([heic, "foto.heic"]) }), env);
+assert.equal(up.status, 415);
+assert.match((await up.json()).error, /HEIC\/AVIF/);
+
+reply = () => "vejo um gráfico";
+res = await call("deepseek_task", { task: "descreva", images: [imgs[0].file_id, "https://exemplo.com/a.png"] });
+assert.equal(res.isError, false, text(res));
+let content = calls[0].body.messages[1].content;
+assert.ok(Array.isArray(content), "com imagens, content vira lista de blocos");
+assert.equal(content[0].type, "text");
+assert.match(content[0].text, /## Imagens anexadas \(na ordem\)\n1\. tela\.png/);
+assert.deepEqual(content[1], { type: "image_url", image_url: { url: `data:image/png;base64,${Buffer.from(png).toString("base64")}` } });
+assert.deepEqual(content[2], { type: "image_url", image_url: { url: "https://exemplo.com/a.png" } });
+
+// imagem grande remontada dos pedaços, e imagens em `files` também viram imagem
+res = await call("deepseek_task", { task: "descreva", files: [imgs[1].file_id, files[0].file_id] });
+content = calls[0].body.messages[1].content;
+assert.equal(content[1].image_url.url, `data:image/jpeg;base64,${Buffer.from(bigJpeg).toString("base64")}`);
+assert.match(content[0].text, /### Arquivo: src\/a\.py/);
+assert.ok(!content[0].text.includes("/9j/"), "imagem não entra como texto");
+
+// sem imagens o content continua texto puro
+res = await call("deepseek_task", { task: "x" });
+assert.equal(typeof calls[0].body.messages[1].content, "string");
+
+// erros
+res = await call("deepseek_task", { task: "x", images: [files[0].file_id] });
+assert.equal(res.isError, true);
+assert.match(text(res), /Não são imagens/);
+res = await call("deepseek_task", { task: "x", images: ["ftp://x"] });
+assert.equal(res.isError, true);
+
+// lote: uma imagem por item
+reply = (body) => `item com ${body.messages[1].content.length - 1} imagem`;
+res = await call("deepseek_batch", { task: "descreva cada", item_files: imgs.map((f) => f.file_id) });
+assert.equal(calls.length, 2);
+assert.equal(calls[0].body.messages[1].content.length, 2);
+assert.match(text(res), /=== tela\.png \(1\/2\)[^\n]*\nitem com 1 imagem/);
+
 // --- PARAR interrompe uma chamada em andamento ---
 reply = () => ({ delayMs: 5 });
 const running = call("deepseek_task", { task: "longa", job: "j-longo", step: "infinita" });

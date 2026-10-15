@@ -12,7 +12,7 @@ import { DEFAULT_MAX_TOKENS, STOP_MESSAGE } from "./ledger-core.js";
 import { MODEL } from "./deepseek.js";
 import { DASHBOARD_HTML } from "./dashboard.js";
 
-const SERVER_INFO = { name: "deepseek-agent", version: "5.0.0" };
+const SERVER_INFO = { name: "deepseek-agent", version: "6.0.0" };
 const SUPPORTED_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 // O cliente do Claude desiste de uma chamada de ferramenta após ~60 s. Por isso cada chamada
@@ -25,6 +25,14 @@ const LINK_TTL_MS = 24 * 3600 * 1000;
 const UPLOAD_TTL_MS = 60 * 60 * 1000;
 const UPLOAD_MAX_FILES = 25;
 const UPLOAD_MAX_TOTAL_CHARS = 5_000_000;
+const UPLOAD_MAX_TOTAL_BYTES = 40 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGES_PER_CALL = 50;
+const MAX_IMAGE_URL_CHARS = 8192;
+const VIDEO_HINT =
+  "O DeepSeek não aceita vídeo, só imagens (JPEG, PNG, GIF, WebP). Extraia quadros e envie-os como imagens, " +
+  'ex.: ffmpeg -i video.mp4 -vf "fps=1,scale=1024:-1" quadro_%03d.jpg (1 quadro/s; ajuste fps à duração e ' +
+  "use no máximo ~50 quadros por chamada). Cite os tempos (quadro N = segundo N) na instrução.";
 
 const REASONING = ["off", "low", "high", "max"];
 const DELIVER = ["inline", "link"];
@@ -62,6 +70,14 @@ const PRESETS = {
 // --- definição das ferramentas (o leitor destas descrições é o Claude) ---
 
 const COMMON_PROPS = {
+  images: {
+    type: "array",
+    items: { type: "string" },
+    description:
+      "Imagens para o DeepSeek ver (JPEG, PNG, GIF, WebP): file_ids de upload (\"f12\") e/ou links " +
+      "http(s). Imagens passadas em `files` também funcionam. Vídeo não é aceito: extraia quadros " +
+      "(ffmpeg) e envie como imagens.",
+  },
   files: {
     type: "array",
     items: { type: "string" },
@@ -118,7 +134,7 @@ const TOOLS = [
     title: "DeepSeek: executar etapa",
     description:
       "Delega UMA etapa de execução ao DeepSeek-V4.1-Flash (barato, rápido): redigir, gerar código/" +
-      "testes/docs, traduzir, resumir, extrair, criticar. Vale a pena quando a saída esperada é muito " +
+      "testes/docs, traduzir, resumir, extrair, criticar, descrever/ler imagens (`images`). Vale a pena quando a saída esperada é muito " +
       "maior que o que você precisa enviar; não vale para pequenas edições em arquivos grandes nem para " +
       "raciocínio difícil ou decisões finais (faça você). O DeepSeek não vê a conversa nem arquivos: " +
       "passe o necessário em `context`, `files` ou `use_results`. Sempre revise o resultado. " +
@@ -203,7 +219,7 @@ const TOOLS = [
     name: "deepseek_upload_url",
     title: "DeepSeek: URL para enviar arquivos",
     description:
-      "Gera uma URL assinada (60 min) para você enviar arquivos de texto com curl, sem gastar tokens de " +
+      "Gera uma URL assinada (60 min) para você enviar arquivos de texto e imagens com curl, sem gastar tokens de " +
       "saída copiando conteúdo. Devolve os file_ids para usar em `files` ou `item_files`. Só funciona " +
       "onde você executa comandos (ex.: Claude Code).",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
@@ -234,6 +250,8 @@ function instructionsFor(origin) {
       "passe `files`/`item_files` em vez de colar conteúdo; (2) encadeie etapas com `use_results` em vez " +
       "de copiar respostas; (3) para salvar um resultado em arquivo, baixe o link `raw` com curl -o em vez " +
       "de reescrevê-lo, e use deliver='link' quando não precisar ler o texto inteiro.",
+    "IMAGENS: o DeepSeek vê imagens (JPEG/PNG/GIF/WebP) via `images` (file_ids do upload ou links http(s)). " +
+      "Vídeo não: extraia quadros (ffmpeg -vf fps=1) e envie como imagens; HEIC/AVIF: converta para JPEG.",
     "RACIOCÍNIO: reasoning='off' para tarefas mecânicas (mais rápido/barato); padrão 'high'; 'max' só " +
       "quando necessário.",
     "TAREFAS LONGAS: resposta '⏳ AINDA EM EXECUÇÃO ids=[..]' → chame deepseek_wait (ou deepseek_task " +
@@ -393,31 +411,83 @@ async function handleUpload(request, url, env) {
   if (!(await verifySigned(env, url, "u", ""))) {
     return json({ error: "URL de upload inválida ou expirada. Chame deepseek_upload_url de novo." }, 403);
   }
-  const files = [];
+  const raw = []; // { name, bytes: Uint8Array }
   const type = request.headers.get("Content-Type") || "";
   try {
     if (type.includes("multipart/form-data")) {
       const form = await request.formData();
       for (const [key, value] of form.entries()) {
-        if (value && typeof value === "object" && typeof value.text === "function") {
-          files.push({ name: value.name || key, content: await value.text() });
+        if (value && typeof value === "object" && typeof value.arrayBuffer === "function") {
+          raw.push({ name: value.name || key, bytes: new Uint8Array(await value.arrayBuffer()) });
         } else {
-          files.push({ name: key, content: String(value) });
+          raw.push({ name: key, bytes: new TextEncoder().encode(String(value)) });
         }
       }
     } else {
-      files.push({ name: request.headers.get("X-File-Name") || "arquivo", content: await request.text() });
+      raw.push({ name: request.headers.get("X-File-Name") || "arquivo", bytes: new Uint8Array(await request.arrayBuffer()) });
     }
   } catch (err) {
     return json({ error: `Não consegui ler o envio: ${err.message}` }, 400);
   }
-  if (!files.length) return json({ error: "Nenhum arquivo recebido." }, 400);
-  if (files.length > UPLOAD_MAX_FILES) return json({ error: `Máximo de ${UPLOAD_MAX_FILES} arquivos por envio.` }, 413);
-  const total = files.reduce((a, f) => a + f.content.length, 0);
-  if (total > UPLOAD_MAX_TOTAL_CHARS) {
-    return json({ error: `Envio grande demais (${total} caracteres; máximo ${UPLOAD_MAX_TOTAL_CHARS}).` }, 413);
+  if (!raw.length) return json({ error: "Nenhum arquivo recebido." }, 400);
+  if (raw.length > UPLOAD_MAX_FILES) return json({ error: `Máximo de ${UPLOAD_MAX_FILES} arquivos por envio.` }, 413);
+  const totalBytes = raw.reduce((a, f) => a + f.bytes.length, 0);
+  if (totalBytes > UPLOAD_MAX_TOTAL_BYTES) {
+    return json({ error: `Envio grande demais (${totalBytes} bytes; máximo ${UPLOAD_MAX_TOTAL_BYTES}). Divida em vários envios.` }, 413);
+  }
+
+  const files = [];
+  let textChars = 0;
+  for (const f of raw) {
+    const kind = sniff(f.bytes);
+    if (kind.video) {
+      return json({ error: `"${f.name}" é um vídeo (${kind.video}). ${VIDEO_HINT}` }, 415);
+    }
+    if (kind.unsupported) {
+      return json({
+        error: `"${f.name}" é ${kind.unsupported}, formato que o DeepSeek não aceita. Converta para JPEG ou PNG ` +
+          `(ex.: ffmpeg -i foto.heic foto.jpg, ou magick foto.heic foto.jpg) e envie de novo.`,
+      }, 415);
+    }
+    if (kind.image) {
+      if (f.bytes.length > MAX_IMAGE_BYTES) {
+        return json({ error: `Imagem "${f.name}" tem ${f.bytes.length} bytes; máximo ${MAX_IMAGE_BYTES}. Reduza a resolução.` }, 413);
+      }
+      files.push({ name: f.name, kind: "image", mime: kind.image, bytes: f.bytes.length, base64: toBase64(f.bytes) });
+    } else {
+      const content = new TextDecoder().decode(f.bytes);
+      textChars += content.length;
+      files.push({ name: f.name, content });
+    }
+  }
+  if (textChars > UPLOAD_MAX_TOTAL_CHARS) {
+    return json({ error: `Texto demais (${textChars} caracteres; máximo ${UPLOAD_MAX_TOTAL_CHARS}).` }, 413);
   }
   return json({ files: await ledger(env).addFiles(files) });
+}
+
+// Detecta o tipo pelo conteúdo (como o DeepSeek faz), não pela extensão.
+function sniff(b) {
+  const at = (i, ...xs) => xs.every((x, k) => b[i + k] === x);
+  const ascii = (i, s) => [...s].every((c, k) => b[i + k] === c.charCodeAt(0));
+  if (at(0, 0xff, 0xd8, 0xff)) return { image: "image/jpeg" };
+  if (at(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return { image: "image/png" };
+  if (ascii(0, "GIF87a") || ascii(0, "GIF89a")) return { image: "image/gif" };
+  if (ascii(0, "RIFF") && ascii(8, "WEBP")) return { image: "image/webp" };
+  if (ascii(0, "RIFF") && ascii(8, "AVI ")) return { video: "AVI" };
+  if (ascii(4, "ftyp")) {
+    const brand = String.fromCharCode(...b.slice(8, 12));
+    if (/^(avif|avis|heic|heix|hevc|mif1|msf1)/.test(brand)) return { unsupported: "HEIC/AVIF" };
+    return { video: brand.startsWith("qt") ? "MOV" : "MP4" };
+  }
+  if (at(0, 0x1a, 0x45, 0xdf, 0xa3)) return { video: "WebM/MKV" };
+  return {};
+}
+
+function toBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
 }
 
 // --- painel ---
@@ -542,7 +612,7 @@ function validateCommon(args) {
 async function runTask(args, ctx) {
   const m = await material(ctx.env, args);
   if (m.error) return toolError(m.error);
-  const s = await start(ctx.env, args, "deepseek_task", compose(args.task, args.context, m.text));
+  const s = await start(ctx.env, args, "deepseek_task", compose(args.task, args.context, m.text), { images: m.images });
   if (!s.ok) return failure(s);
   return present(ctx, [s.id]);
 }
@@ -553,7 +623,7 @@ async function runJson(args, ctx) {
   const instructions =
     `${args.task}\n\nResponda SOMENTE com um objeto JSON válido (sem markdown, sem texto fora do JSON) ` +
     `no seguinte formato:\n${args.schema}`;
-  const s = await start(ctx.env, args, "deepseek_json", compose(instructions, args.context, m.text), { json: true });
+  const s = await start(ctx.env, args, "deepseek_json", compose(instructions, args.context, m.text), { json: true, images: m.images });
   if (!s.ok) return failure(s);
   return present(ctx, [s.id]);
 }
@@ -574,7 +644,11 @@ async function runBatch(args, ctx) {
   if (itemFileIds.ids.length) {
     const r = await ledger(ctx.env).getFiles(itemFileIds.ids);
     if (r.missing.length) return toolError(missingFiles(r.missing));
-    for (const f of r.found) items.push({ label: f.name, text: fileBlock(f) });
+    for (const f of r.found) {
+      // Imagem vira um item com a imagem anexada (ex.: "descreva cada foto").
+      if (f.kind === "image") items.push({ label: f.name, text: `(imagem anexada: ${f.name})`, images: [{ url: f.dataUrl }] });
+      else items.push({ label: f.name, text: fileBlock(f) });
+    }
   }
   if (!items.length) return toolError("Informe `items` e/ou `item_files`.");
   if (items.length > BATCH_MAX_ITEMS) {
@@ -592,7 +666,8 @@ async function runBatch(args, ctx) {
     if (shared) parts.push(`## Contexto comum\n${shared}`);
     parts.push(`## Item ${i + 1} de ${items.length}\n${items[i].text}`);
     const step = `${args.step ? args.step + " · " : ""}${items[i].label} (${i + 1}/${items.length})`;
-    const s = await start(ctx.env, { ...args, step }, "deepseek_batch", parts.join("\n\n"));
+    const images = [...m.images, ...(items[i].images || [])]; // imagens comuns + a do item
+    const s = await start(ctx.env, { ...args, step }, "deepseek_batch", parts.join("\n\n"), { images });
     if (!s.ok) {
       if (!ids.length) return failure(s);
       break; // PARAR acionado no meio do disparo: devolve o que já começou
@@ -618,13 +693,14 @@ async function runUploadUrl(ctx) {
       `URL de upload (válida até ${until} UTC):`,
       url,
       "",
-      "Envie um ou vários arquivos de texto (UTF-8); o `filename` vira o rótulo que o DeepSeek verá:",
+      "Envie arquivos de texto (UTF-8) e/ou imagens (JPEG, PNG, GIF, WebP; até 10 MB cada); o `filename` vira o rótulo:",
       `curl -s -X POST "${url}" -F "f=@src/a.py;filename=src/a.py" -F "f=@src/b.py;filename=src/b.py"`,
       "(No PowerShell use curl.exe.) Resposta:",
       '{"files":[{"file_id":"f12","name":"src/a.py","chars":1234}, ...]}',
       "",
-      "Depois use `files: [\"f12\", ...]` em qualquer ferramenta (contexto) ou `item_files` no deepseek_batch " +
-        `(um item por arquivo). Até ${UPLOAD_MAX_FILES} arquivos por envio; arquivos expiram em 7 dias.`,
+      "Depois use `files: [\"f12\", ...]` (texto e imagens) ou `images` em qualquer ferramenta, ou `item_files` no deepseek_batch " +
+        `(um item por arquivo). Até ${UPLOAD_MAX_FILES} arquivos por envio; expiram em 7 dias.`,
+      "Vídeo não é aceito pelo DeepSeek: extraia quadros com ffmpeg e envie-os como imagens.",
     ].join("\n")
   );
 }
@@ -696,14 +772,67 @@ function fileBlock(f) {
   return `### Arquivo: ${f.name} (f${f.id})\n\`\`\`\n${f.content}\n\`\`\``;
 }
 
+/**
+ * Monta o material de contexto: texto (arquivos de texto + resultados anteriores) e imagens
+ * (`images` + imagens que vierem em `files`). Devolve { text, images: [{ url, label }] } ou { error }.
+ */
 async function material(env, args) {
   const parts = [];
+  const images = [];
+
+  // `images`: ids de imagens enviadas ("f12") e/ou links http(s).
+  const imgList = asList(args.images);
+  if (imgList != null) {
+    if (!Array.isArray(imgList)) return { error: "`images` deve ser uma lista de ids (\"f12\") e/ou links http(s)." };
+    // Preserva a ordem pedida: a lista "Imagens anexadas" numera as imagens nessa ordem.
+    const slots = [];
+    const ids = [];
+    for (const v of imgList) {
+      const s = String(v).trim();
+      if (/^https?:\/\//i.test(s)) {
+        if (s.length > MAX_IMAGE_URL_CHARS) return { error: `Link de imagem longo demais (máximo ${MAX_IMAGE_URL_CHARS} caracteres).` };
+        slots.push({ url: s, label: s.slice(0, 80) });
+      } else {
+        const m = s.match(/^f?(\d+)$/i);
+        if (!m) return { error: `Imagem inválida: ${s}. Use file_ids do upload ("f12") ou links http(s).` };
+        slots.push({ id: Number(m[1]) });
+        ids.push(Number(m[1]));
+      }
+    }
+    if (ids.length) {
+      const r = await ledger(env).getFiles(ids);
+      if (r.missing.length) return { error: missingFiles(r.missing) };
+      const notImg = r.found.filter((f) => f.kind !== "image");
+      if (notImg.length) {
+        return { error: `Não são imagens: ${notImg.map((f) => `f${f.id} (${f.name})`).join(", ")}. Passe-os em \`files\`.` };
+      }
+      const byId = new Map(r.found.map((f) => [f.id, f]));
+      for (const slot of slots) {
+        if (slot.id == null) continue;
+        const f = byId.get(slot.id);
+        slot.url = f.dataUrl;
+        slot.label = `${f.name} (f${f.id})`;
+      }
+    }
+    images.push(...slots.map(({ url, label }) => ({ url, label })));
+  }
+
   const fileIds = parseFileIds(args.files);
   if (fileIds.error) return { error: fileIds.error };
   if (fileIds.ids.length) {
     const r = await ledger(env).getFiles(fileIds.ids);
     if (r.missing.length) return { error: missingFiles(r.missing) };
-    parts.push(`## Arquivos\n\n${r.found.map(fileBlock).join("\n\n")}`);
+    const texts = r.found.filter((f) => f.kind !== "image");
+    // Imagens passadas em `files` também viram imagens (o Claude não precisa separar).
+    for (const f of r.found.filter((f) => f.kind === "image")) images.push({ url: f.dataUrl, label: `${f.name} (f${f.id})` });
+    if (texts.length) parts.push(`## Arquivos\n\n${texts.map(fileBlock).join("\n\n")}`);
+  }
+
+  if (images.length > MAX_IMAGES_PER_CALL) {
+    return { error: `Máximo de ${MAX_IMAGES_PER_CALL} imagens por chamada (recebi ${images.length}); divida em etapas ou use deepseek_batch.` };
+  }
+  if (images.length) {
+    parts.push(`## Imagens anexadas (na ordem)\n${images.map((im, i) => `${i + 1}. ${im.label}`).join("\n")}`);
   }
   if (args.use_results != null) {
     const list = asIntList(args.use_results);
@@ -718,7 +847,7 @@ async function material(env, args) {
         r.found.map((c) => `### Resultado da chamada ${c.id}${c.step ? ` (${c.step})` : ""}\n${c.result}`).join("\n\n")
     );
   }
-  return { text: parts.join("\n\n") };
+  return { text: parts.join("\n\n"), images };
 }
 
 function compose(task, context, extra) {
@@ -730,12 +859,16 @@ function compose(task, context, extra) {
 
 // --- DeepSeek via Ledger ---
 
-function start(env, args, tool, userContent, { json = false } = {}) {
+function start(env, args, tool, userContent, { json = false, images = [] } = {}) {
   const system = [BASE_SYSTEM, PRESETS[args.preset || "general"], args.system].filter(Boolean).join("\n\n");
+  // Com imagens, o conteúdo do usuário vira lista de blocos (texto + image_url), formato OpenAI.
+  const content = images.length
+    ? [{ type: "text", text: userContent }, ...images.map((im) => ({ type: "image_url", image_url: { url: im.url } }))]
+    : userContent;
   const payload = {
     // Modelo fixo (DeepSeek-V4.1-Flash); qualquer `model` recebido é ignorado.
     model: MODEL,
-    messages: [{ role: "system", content: system }, { role: "user", content: userContent }],
+    messages: [{ role: "system", content: system }, { role: "user", content }],
     // Sempre o máximo do modelo: o gasto é controlado pelo usuário no painel (PARAR),
     // nunca por limite escolhido pelo orquestrador. `max_tokens` recebido é ignorado.
     max_tokens: DEFAULT_MAX_TOKENS,

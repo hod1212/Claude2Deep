@@ -139,6 +139,32 @@ Você não precisa pedir nada disso: o servidor explica essas técnicas ao Claud
 
 ---
 
+## Imagens e vídeo
+
+O DeepSeek **enxerga imagens**: lê textos em prints, descreve fotos, interpreta gráficos, compara telas.
+
+- **Formatos aceitos:** JPEG, PNG, GIF e WebP, até 10 MB cada e até 50 por chamada. Cada imagem conta no máximo uns 1.000 tokens de entrada, então é barato: ler uma imagem simples custou **US$ 0,0001** no teste.
+- **No Claude Code:** o Claude envia as imagens com `curl` (como os arquivos de texto) e passa os ids em `images`. Imagens enviadas em `files` também são reconhecidas.
+- **Links:** imagens públicas na internet podem ir direto pelo endereço `https://...`.
+- **Em lote:** *"descreva cada uma destas 20 fotos"* vira um lote com uma imagem por item.
+- **HEIC/AVIF** (comuns em fotos de iPhone) **não são aceitos**. O Claude converte para JPEG antes de enviar.
+
+**Vídeo não é aceito pelo DeepSeek.** O caminho é extrair quadros do vídeo e enviá-los como imagens. No Claude Code, se o programa `ffmpeg` estiver instalado, o Claude faz isso sozinho; o servidor ensina o comando quando recebe um vídeo. Por exemplo, um quadro por segundo:
+
+```bash
+ffmpeg -i video.mp4 -vf "fps=1,scale=1024:-1" quadro_%03d.jpg
+```
+
+Para vídeos longos, use menos quadros (por exemplo `fps=1/5`, um a cada 5 segundos).
+
+Exemplos de pedido:
+
+> Envie estes 12 prints de tela ao DeepSeek e peça uma lista de todos os textos de erro que aparecem.
+
+> Extraia um quadro a cada 2 segundos deste vídeo e peça ao DeepSeek para descrever o que acontece em cada trecho.
+
+---
+
 ## Tarefas longas
 
 Não há limite de tamanho para a resposta: cada chamada pode usar até o máximo do modelo (**384 mil tokens** no flash). Tarefas grandes podem levar minutos.

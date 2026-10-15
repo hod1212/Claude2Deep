@@ -13,6 +13,7 @@ export const STOP_MESSAGE =
   "e pergunte ao usuário como prosseguir. Ele pode clicar em Retomar no painel.";
 
 const FILE_TTL_MS = 7 * 24 * 3600 * 1000; // arquivos enviados expiram em 7 dias
+const CHUNK_CHARS = 1_000_000; // pedaço de base64 por linha (limite de 2 MB por valor no SQLite do DO)
 
 // Limite de texto gravado por chamada (valores no SQLite do Durable Object: até 2 MB).
 const MAX_STORED_CHARS = 1_500_000;
@@ -46,6 +47,13 @@ export class LedgerCore {
     // Arquivos enviados pelo orquestrador (upload por URL assinada), referenciados como "f<id>".
     sql.exec(`CREATE TABLE IF NOT EXISTS files (
       id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, content TEXT, chars INTEGER, created INTEGER)`);
+    // v6: imagens (kind='image', base64 em pedaços: valores do SQLite do DO vão até 2 MB).
+    for (const col of ["kind TEXT", "mime TEXT", "bytes INTEGER"]) {
+      try {
+        sql.exec(`ALTER TABLE files ADD COLUMN ${col}`);
+      } catch {}
+    }
+    sql.exec(`CREATE TABLE IF NOT EXISTS file_chunks (file_id INTEGER, seq INTEGER, data TEXT, PRIMARY KEY (file_id, seq))`);
     // Chamadas que ficaram "rodando" de uma instância anterior não vão terminar.
     sql.exec(`UPDATE calls SET status = 'perdida', ended = ? WHERE status = 'rodando'`, Date.now());
   }
@@ -71,31 +79,57 @@ export class LedgerCore {
     if (this.active.size) return { ok: false, error: "Há chamadas em andamento." };
     this.sql.exec(`DELETE FROM calls`);
     this.sql.exec(`DELETE FROM files`);
+    this.sql.exec(`DELETE FROM file_chunks`);
     return { ok: true };
   }
 
   // --- arquivos enviados e resultados reutilizáveis ---
 
-  /** Grava arquivos [{ name, content }] e devolve [{ file_id, name, chars }]. */
+  /**
+   * Grava arquivos e devolve os ids. Texto: { name, content }. Imagem: { name, kind: "image",
+   * mime, base64, bytes } (guardada em pedaços).
+   */
   addFiles(files) {
-    this.sql.exec(`DELETE FROM files WHERE created < ?`, Date.now() - FILE_TTL_MS);
+    const expired = Date.now() - FILE_TTL_MS;
+    this.sql.exec(`DELETE FROM file_chunks WHERE file_id IN (SELECT id FROM files WHERE created < ?)`, expired);
+    this.sql.exec(`DELETE FROM files WHERE created < ?`, expired);
     return files.map((f) => {
+      if (f.kind === "image") {
+        const id = this.rows(
+          `INSERT INTO files (name, content, chars, created, kind, mime, bytes) VALUES (?, '', 0, ?, 'image', ?, ?) RETURNING id`,
+          f.name, Date.now(), f.mime, f.bytes
+        )[0].id;
+        for (let i = 0, seq = 0; i < f.base64.length; i += CHUNK_CHARS, seq++) {
+          this.sql.exec(`INSERT INTO file_chunks (file_id, seq, data) VALUES (?, ?, ?)`, id, seq, f.base64.slice(i, i + CHUNK_CHARS));
+        }
+        return { file_id: `f${id}`, name: f.name, kind: "image", mime: f.mime, bytes: f.bytes };
+      }
       const content = clip(f.content);
       const id = this.rows(
-        `INSERT INTO files (name, content, chars, created) VALUES (?, ?, ?, ?) RETURNING id`,
+        `INSERT INTO files (name, content, chars, created, kind) VALUES (?, ?, ?, ?, 'text') RETURNING id`,
         f.name, content, content.length, Date.now()
       )[0].id;
-      return { file_id: `f${id}`, name: f.name, chars: content.length };
+      return { file_id: `f${id}`, name: f.name, kind: "text", chars: content.length };
     });
   }
 
-  /** ids numéricos -> { found: [{ id, name, content }], missing: [id] } */
+  /**
+   * ids numéricos -> { found: [{ id, name, kind, content? , dataUrl? }], missing: [id] }.
+   * Imagens voltam como data URL (data:<mime>;base64,...).
+   */
   getFiles(ids) {
     const found = [];
     const missing = [];
     for (const id of ids) {
-      const r = this.rows(`SELECT id, name, content FROM files WHERE id = ?`, id)[0];
-      r ? found.push(r) : missing.push(id);
+      const r = this.rows(`SELECT id, name, content, kind, mime FROM files WHERE id = ?`, id)[0];
+      if (!r) {
+        missing.push(id);
+      } else if (r.kind === "image") {
+        const data = this.rows(`SELECT data FROM file_chunks WHERE file_id = ? ORDER BY seq`, id).map((c) => c.data).join("");
+        found.push({ id: r.id, name: r.name, kind: "image", dataUrl: `data:${r.mime};base64,${data}` });
+      } else {
+        found.push({ id: r.id, name: r.name, kind: "text", content: r.content });
+      }
     }
     return { found, missing };
   }
